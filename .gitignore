@@ -1,0 +1,6 @@
+.env
+*.pid
+*.log
+agentmail/.seen_events
+agentmail/.ws_fifo
+agentmail/.ws_out
