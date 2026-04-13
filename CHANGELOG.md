@@ -2,6 +2,12 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-04-13 — Session transcript access
+- Added `./sessions/` symlink → `~/.claude/projects/-Users-agent-mail1-mega/` so Claude can read/grep past session transcripts
+- Added `setup-sessions` step to Makefile (runs during `make setup`)
+- Updated CLAUDE.md to document session transcripts
+- Gitignored `sessions` (runtime symlink, not portable)
+
 ## 2026-04-13 (session 5) — Slack thread context recovery
 - Fixed: replies to proactive messages (bot-initiated threads) started fresh sessions with no context
 - Added `fetchThreadHistory()` — calls `conversations.replies` to get all prior messages in the thread

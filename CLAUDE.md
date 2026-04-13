@@ -8,6 +8,9 @@ Your memories are in the `./memories` directory. At the start of every session, 
 
 Memory syncs across all agent instances via memfs. What you learn in one instance is available to all others.
 
+### Session Transcripts
+Full transcripts of all past sessions (including harness-invoked sessions from email and Slack) are in `./sessions/` as JSONL files. Each file is a complete conversation log — user messages, assistant responses, and tool calls. Read or grep these to recall what happened in previous interactions.
+
 ## Core Principles
 
 ### 1. Proactiveness
@@ -61,6 +64,7 @@ mega/
 ├── .env.example       # Template for secrets
 ├── .env               # Secrets (gitignored)
 ├── .gitignore
+├── sessions/          # Session transcripts (symlink, gitignored)
 └── memories/          # Shared memory (synced via memfs)
 ```
 

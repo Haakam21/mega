@@ -1,7 +1,7 @@
-.PHONY: setup setup-deps setup-memfs setup-env setup-github start stop status test test-unit test-e2e
+.PHONY: setup setup-deps setup-sessions setup-memfs setup-env setup-github start stop status test test-unit test-e2e
 
 # Agent image setup — run once on a new machine
-setup: setup-deps setup-memfs setup-env setup-github
+setup: setup-deps setup-sessions setup-memfs setup-env setup-github
 	@echo ""
 	@echo "Agent setup complete."
 	@. ./.env && echo "Inbox: $$AGENTMAIL_INBOX_ID"
@@ -16,7 +16,17 @@ setup-deps:
 	@command -v gh >/dev/null || (echo "Error: gh not found. Install with: brew install gh" && exit 1)
 	@echo "All dependencies OK."
 
-# Step 2: Memory system
+# Step 2: Session transcripts — symlink Claude's session storage into project
+setup-sessions:
+	@echo "=== Setting up session transcripts ==="
+	@if [ -L sessions ]; then \
+		echo "sessions symlink already exists."; \
+	else \
+		echo "Linking sessions to Claude session storage..."; \
+		ln -sf "$$HOME/.claude/projects/-Users-agent-mail1-mega" sessions; \
+	fi
+
+# Step 3: Memory system
 setup-memfs:
 	@echo "=== Setting up memory system (memfs) ==="
 	@if [ -x "$$HOME/.memfs/memfs" ]; then \
