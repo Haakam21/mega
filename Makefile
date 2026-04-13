@@ -1,7 +1,7 @@
-.PHONY: setup start stop status
+.PHONY: setup setup-deps setup-memfs setup-env setup-github start stop status test test-unit test-e2e
 
 # Agent image setup — run once on a new machine
-setup: setup-deps setup-memfs setup-env
+setup: setup-deps setup-memfs setup-env setup-github
 	@echo ""
 	@echo "Agent setup complete."
 	@. ./.env && echo "Inbox: $$AGENTMAIL_INBOX_ID"
@@ -12,7 +12,8 @@ setup-deps:
 	@echo "=== Checking dependencies ==="
 	@command -v claude >/dev/null || (echo "Error: claude CLI not found. Install from https://claude.ai/code" && exit 1)
 	@command -v jq >/dev/null || (echo "Error: jq not found. Install with: brew install jq" && exit 1)
-	@command -v node >/dev/null || (echo "Error: node not found. Install from https://nodejs.org" && exit 1)
+	@command -v bun >/dev/null || (echo "Error: bun not found. Install with: curl -fsSL https://bun.sh/install | bash" && exit 1)
+	@command -v gh >/dev/null || (echo "Error: gh not found. Install with: brew install gh" && exit 1)
 	@echo "All dependencies OK."
 
 # Step 2: Memory system
@@ -46,32 +47,54 @@ setup-env:
 	[ -z "$$MEMFS_SYNC_TOKEN" ] && missing="$$missing MEMFS_SYNC_TOKEN" ; \
 	[ -z "$$AGENTMAIL_API_KEY" ] && missing="$$missing AGENTMAIL_API_KEY" ; \
 	[ -z "$$AGENTMAIL_INBOX_ID" ] && missing="$$missing AGENTMAIL_INBOX_ID" ; \
+	[ -z "$$GITHUB_TOKEN" ] && missing="$$missing GITHUB_TOKEN" ; \
 	if [ -n "$$missing" ]; then \
 		echo "Error: missing values in .env:$$missing"; \
 		exit 1; \
 	fi && \
 	echo "All environment variables set."
 
-# Start the agent — kills any existing listeners first
-start: stop
-	@echo "Starting AgentMail listener..."
-	@nohup ./agentmail/listener.sh > agentmail/listener.log 2>&1 & \
-	echo $$! > agentmail/listener.pid; \
-	echo "AgentMail listener started (PID $$!)"
+# Step 4: Verify GitHub CLI authentication
+setup-github:
+	@echo "=== Verifying GitHub authentication ==="
+	@. ./.env && GITHUB_TOKEN="$$GITHUB_TOKEN" gh auth status 2>&1 | head -4
+	@echo "GitHub authentication OK."
 
-# Stop the agent — kills ALL related processes
+# Start the agent — kills any existing instance first
+start: stop
+	@echo "Starting agent harness..."
+	@nohup bun run index.ts > harness.log 2>&1 & \
+	echo $$! > harness.pid; \
+	echo "Agent harness started (PID $$!)"
+
+# Stop the agent — kills current and any legacy processes
 stop:
+	@if [ -f harness.pid ] && kill -0 $$(cat harness.pid) 2>/dev/null; then \
+		kill $$(cat harness.pid) 2>/dev/null || true; \
+	fi
+	@pkill -f "bun.*index\.ts" 2>/dev/null || true
 	@pkill -f "agentmail/listener\.sh" 2>/dev/null || true
 	@pkill -f "agentmail/ws\.js" 2>/dev/null || true
-	@rm -f agentmail/listener.pid
-	@echo "AgentMail listener stopped."
+	@rm -f harness.pid agentmail/listener.pid
+	@echo "Agent harness stopped."
 
 # Show agent status
 status:
 	@echo "=== Agent Status ==="
 	@. ./.env 2>/dev/null && echo "Inbox: $$AGENTMAIL_INBOX_ID" || echo "Inbox: not configured"
-	@if pgrep -f "agentmail/listener\.sh" >/dev/null 2>&1; then \
-		echo "AgentMail listener: running (PID $$(pgrep -f 'agentmail/listener\.sh'))"; \
+	@if [ -f harness.pid ] && kill -0 $$(cat harness.pid) 2>/dev/null; then \
+		echo "Agent harness: running (PID $$(cat harness.pid))"; \
 	else \
-		echo "AgentMail listener: stopped"; \
+		echo "Agent harness: stopped"; \
 	fi
+
+# Run all tests (unit + E2E — harness must be running for E2E)
+test: test-unit test-e2e
+
+# Unit tests only
+test-unit:
+	@bun test core/invoke.test.ts core/websocket.test.ts slack/channel.test.ts
+
+# E2E tests (requires harness running + .env configured)
+test-e2e:
+	@bun test agentmail/e2e.test.ts --timeout 130000

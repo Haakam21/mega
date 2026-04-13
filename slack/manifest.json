@@ -1,0 +1,45 @@
+{
+  "display_information": {
+    "name": "Mega",
+    "description": "Haakam's digital clone"
+  },
+  "features": {
+    "assistant_view": {
+      "assistant_description": "Haakam's digital clone",
+      "suggested_prompts": []
+    },
+    "bot_user": {
+      "display_name": "Mega",
+      "always_online": true
+    }
+  },
+  "settings": {
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": true,
+    "token_rotation_enabled": false,
+    "event_subscriptions": {
+      "bot_events": [
+        "assistant_thread_started",
+        "assistant_thread_context_changed",
+        "message.im",
+        "app_mention"
+      ]
+    },
+    "interactivity": {
+      "is_enabled": false
+    }
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "assistant:write",
+        "chat:write",
+        "files:read",
+        "im:history",
+        "reactions:write",
+        "app_mentions:read",
+        "users:read"
+      ]
+    }
+  }
+}
