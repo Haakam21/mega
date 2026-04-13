@@ -7,7 +7,7 @@ const inboxId = process.env.AGENTMAIL_INBOX_ID!;
 const encodedInbox = encodeURIComponent(inboxId);
 
 const SYSTEM_PROMPT =
-  "CRITICAL: Your entire response will be sent verbatim as an email reply. Output ONLY the reply body — no thinking, no commentary, no narration, no action summaries. Just the email text as Mega would write it.";
+  "You are responding via email. Your final response will be sent verbatim as an email reply, so make sure it contains only the reply body.";
 
 async function handleMessage(data: any) {
   const msg = data.message;

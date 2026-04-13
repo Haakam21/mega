@@ -5,7 +5,7 @@ const botToken = process.env.SLACK_BOT_TOKEN!;
 const appToken = process.env.SLACK_APP_TOKEN!;
 
 const SYSTEM_PROMPT =
-  "CRITICAL: Your entire response will be sent verbatim as a Slack message. Output ONLY the message text — no thinking, no commentary, no narration, no action summaries. Just the message as Mega would write it. Keep it casual and concise.";
+  "You are responding via Slack. Your final response will be posted verbatim as a Slack message, so make sure it contains only the message text.";
 
 const THINKING_EMOJI = "thinking_face";
 

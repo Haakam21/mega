@@ -76,7 +76,7 @@ mega/
 Each channel (email, Slack) follows the same pattern:
 1. Channel connects via `core/websocket.ts` (shared reconnecting WebSocket client)
 2. Incoming events are deduped and passed to `core/invoke.ts`
-3. `invoke.ts` calls `claude --print` with session continuity (--resume/--session-id)
+3. `invoke.ts` calls `claude --print` with full tool access (`--dangerously-skip-permissions`), session continuity (`--resume`/`--session-id`), and `cwd` set to project root so CLAUDE.md and memories are available
 4. Channel sends the response back via its own API
 5. `bun run index.ts` starts all configured channels in one process
 

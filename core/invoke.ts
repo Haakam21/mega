@@ -1,9 +1,16 @@
-import { existsSync, readFileSync, appendFile } from "fs";
+import { existsSync, readFileSync, appendFile, realpathSync } from "fs";
 import { createHash } from "crypto";
 import { join } from "path";
 
 const ROOT = join(import.meta.dir, "..");
 const SEEN_FILE = join(ROOT, ".seen_events");
+const MEMORIES_SYMLINK = join(ROOT, "memories");
+
+// Resolve the memories symlink to the real path (FUSE mount)
+// Claude's tools don't follow symlinks into FUSE mounts, so we need --add-dir
+const MEMORIES_REAL_PATH = existsSync(MEMORIES_SYMLINK)
+  ? realpathSync(MEMORIES_SYMLINK)
+  : null;
 
 // Convert any string to a deterministic UUID-formatted hash
 // Claude CLI requires session IDs to be valid UUIDs
@@ -99,12 +106,14 @@ export function invokeWithHandle(options: InvokeOptions): InvokeHandle {
           "--print",
           "--output-format",
           "json",
+          "--dangerously-skip-permissions",
+          ...(MEMORIES_REAL_PATH ? ["--add-dir", MEMORIES_REAL_PATH] : []),
           "--append-system-prompt",
           systemPrompt,
           ...sessionArgs,
           prompt,
         ],
-        { stdin: "ignore", stdout: "pipe", stderr: "ignore" }
+        { stdin: "ignore", stdout: "pipe", stderr: "ignore", cwd: ROOT }
       );
 
       const output = await new Response(currentProc.stdout).text();
