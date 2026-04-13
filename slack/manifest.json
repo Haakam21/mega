@@ -36,6 +36,7 @@
         "chat:write",
         "files:read",
         "im:history",
+        "im:write",
         "reactions:write",
         "app_mentions:read",
         "users:read"

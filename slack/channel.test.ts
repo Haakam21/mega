@@ -57,4 +57,29 @@ describe("buildPrompt", () => {
     expect(result).not.toContain("attached");
     expect(result).not.toContain("file(s)");
   });
+
+  test("thread history prepended when provided", () => {
+    const history = "Thread history (earlier messages in this thread):\n[mega]: hey I have a proposal\n[U456]: sounds good\n\n---\n\n";
+    const result = buildPrompt("C123", "U456", "1234.5678", [
+      { text: "tell me more" },
+    ], history);
+    expect(result).toStartWith("Thread history");
+    expect(result).toContain("[mega]: hey I have a proposal");
+    expect(result).toContain("[U456]: sounds good");
+    expect(result).toContain("tell me more");
+  });
+
+  test("no thread history means no prefix", () => {
+    const result = buildPrompt("C123", "U456", "1234.5678", [
+      { text: "hello" },
+    ]);
+    expect(result).toStartWith("New Slack message:");
+  });
+
+  test("empty thread history string treated as no history", () => {
+    const result = buildPrompt("C123", "U456", "1234.5678", [
+      { text: "hello" },
+    ], "");
+    expect(result).toStartWith("New Slack message:");
+  });
 });

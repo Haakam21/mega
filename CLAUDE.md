@@ -85,6 +85,8 @@ Each channel (email, Slack) follows the same pattern:
 2. When an email arrives, it invokes Claude via `core/invoke.ts`
 3. Claude's response is sent as a reply via the AgentMail API
 4. Same email thread = same Claude session (thread ID used as session ID)
+5. Send endpoint: `POST /v0/inboxes/{inbox}/messages/send` with `{to, subject, text}`
+6. Attachments: include `attachments` array with `{content (base64), filename, content_type}`
 
 ### How Slack Works
 1. Create a Slack app at api.slack.com using `slack/manifest.json`
@@ -96,6 +98,9 @@ Each channel (email, Slack) follows the same pattern:
 7. Mega appears in Slack's **Agents** tab (via `assistant_view` feature in manifest)
 8. Messages can interrupt an in-progress invocation — Claude restarts with all messages combined
 9. 🤔 reaction on the latest message indicates thinking (doesn't block input like `setStatus`)
+10. Thread context recovery: every invocation fetches thread history via `conversations.replies` and prepends it to the prompt, so even fresh sessions have full context (fixes proactive message session mismatch)
+11. Mega can proactively DM users via `conversations.open` + `chat.postMessage` (requires `im:write` scope)
+    - Haakam's Slack user ID: `U08TMCS2KRT`, DM channel: `D0AS9T5CP4K`
 
 ### Testing
 - `make test` — run all tests (unit + E2E)

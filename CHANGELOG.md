@@ -2,6 +2,21 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-04-13 (session 5) — Slack thread context recovery
+- Fixed: replies to proactive messages (bot-initiated threads) started fresh sessions with no context
+- Added `fetchThreadHistory()` — calls `conversations.replies` to get all prior messages in the thread
+- Added `formatThreadHistory()` — formats prior messages as `[mega]` or `[userId]` lines
+- Updated `buildPrompt()` to accept and prepend thread history
+- `handleMessage()` now fetches thread history before every invocation
+- One Slack API call per message, no new deps
+- Also learned: should always check thread history via Slack API when entering a thread (noted for future use)
+
+## 2026-04-13 (session 4) — Proactive Slack DMs & email attachments
+- Added `im:write` scope to `slack/manifest.json` so Mega can initiate DMs (not just respond)
+- Verified proactive messaging works: `conversations.open` → `chat.postMessage`
+- Discovered AgentMail send endpoint uses `text` field (not `body`) and supports `attachments` array with base64-encoded content
+- Updated CLAUDE.md with Slack proactive DM docs, Haakam's Slack IDs, and email attachment format
+
 ## 2026-04-13 (session 3) — Fix channel tool access & memories
 - Fixed `core/invoke.ts`: added `cwd: ROOT` so Claude runs in the project directory (reads CLAUDE.md, can access memories)
 - Fixed `core/invoke.ts`: added `--dangerously-skip-permissions` so Claude has full tool access in `--print` mode (same capabilities as interactive session)

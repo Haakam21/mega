@@ -58,7 +58,33 @@ async function handleThreadStarted(evt: any) {
   });
 }
 
-export function buildPrompt(channel: string, user: string, threadTs: string, messages: any[]): string {
+async function fetchThreadHistory(channel: string, threadTs: string): Promise<any[]> {
+  try {
+    const result = await slackAPI("conversations.replies", {
+      channel,
+      ts: threadTs,
+    });
+    if (result.ok && result.messages) return result.messages;
+  } catch (err) {
+    console.error("[slack] Failed to fetch thread history:", err);
+  }
+  return [];
+}
+
+function formatThreadHistory(messages: any[], currentTs: string, myUserId: string): string {
+  // Only include messages before the current one
+  const prior = messages.filter((m) => m.ts !== currentTs);
+  if (prior.length === 0) return "";
+
+  const lines = prior.map((m) => {
+    const who = m.bot_id || m.user === myUserId ? "mega" : m.user;
+    return `[${who}]: ${m.text || "(no text)"}`;
+  });
+
+  return `Thread history (earlier messages in this thread):\n${lines.join("\n")}\n\n---\n\n`;
+}
+
+export function buildPrompt(channel: string, user: string, threadTs: string, messages: any[], threadHistory?: string): string {
   const parts: string[] = [];
   const allFiles: string[] = [];
 
@@ -76,7 +102,7 @@ export function buildPrompt(channel: string, user: string, threadTs: string, mes
     attachmentNote = `\n\n(The user attached ${allFiles.length} file(s): ${allFiles.join(", ")}. You cannot view these yet — let the user know.)`;
   }
 
-  return `New Slack message:
+  return `${threadHistory || ""}New Slack message:
 
 From user: ${user}
 Channel: ${channel}
@@ -117,7 +143,13 @@ async function handleMessage(evt: any) {
   });
 
   const messages = active ? active.messages : [evt];
-  const prompt = buildPrompt(channel, user, threadTs, messages);
+
+  // Fetch thread history so Claude has context even in a fresh session
+  const myId = await getBotUserId();
+  const threadMessages = await fetchThreadHistory(channel, threadTs);
+  const threadHistory = formatThreadHistory(threadMessages, evt.ts, myId);
+
+  const prompt = buildPrompt(channel, user, threadTs, messages, threadHistory);
 
   const handle = invokeWithHandle({
     eventId: `slack-${channel}-${evt.ts}`,
