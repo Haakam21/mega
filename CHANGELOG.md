@@ -2,6 +2,10 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-04-13 (session 2)
+- Changed inbox from `sillyagreement801@agentmail.to` to `mega1@agentmail.to`
+- `mega@agentmail.to` was taken, settled on `mega1`
+
 ## 2026-04-13
 - Rewrote agent harness from bash/node to Bun + TypeScript
 - Factored shared logic into `core/invoke.ts` (dedup, Claude invocation, session continuity)
