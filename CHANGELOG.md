@@ -27,6 +27,18 @@ Fixes for the "Mega Claude sessions pile up and crash the host" class of bug. Di
 - **Tests**: added `test/tree-claude.sh` (mock that spawns a long-lived child) and a `treeKill` unit test that verifies the process-group signal actually reaches child processes. Full suite: 23 pass / 0 fail.
 - Follow-ups not in this pass: C (AgentMail concurrency/interrupt), E (bounded `.seen_events`), G (process watchdog), H (more invocation logging).
 
+## 2026-04-14 — Fix silent FUSE mount failure (upstream memfs v0.12.2)
+Writing directly to `./memories/topics/foo.md` (through the FUSE symlink) was silently creating **unindexed** files on the backing directory — `ls memories/` saw them, but `memfs find`, `memfs search`, and `memfs sync` did not. Root cause: fuser silently enables `allow_other` when AutoUnmount is set, which fusermount3 rejects unless `/etc/fuse.conf` has `user_allow_other`. The systemd unit then crash-looped silently, and `memfs init`'s old `read_dir().is_ok()` health check saw the backing directory and reported "Mounted" anyway. Writes to `memfs/topics/*.md` ended up on the backing fs, which `init` had pre-seeded as real directories (compounding the shadow).
+
+Fixed upstream in [`a728ae1`](https://github.com/Haakam21/mem-fs/commit/a728ae1) (released as `v0.12.2`):
+- `memfs init` now checks `/etc/fuse.conf` for `user_allow_other` on Linux and bails with the exact `echo user_allow_other | sudo tee -a /etc/fuse.conf` fix command if missing.
+- Mount health check replaced with `is_fuse_mounted()` which reads `/proc/self/mountinfo` (Linux) or `mount(8)` (macOS) looking for a fuse-type entry at the target path.
+- Facet categories are now seeded in the db (`facets` table) instead of as real backing directories, so they never shadow the FUSE view. Legacy facet dirs from older inits get `remove_dir_all`'d on the next init run.
+
+After upgrading to memfs 0.12.2, Claude can write memories with a normal file API (`./memories/topics/foo.md`) and they're properly indexed, tagged (`topics:foo`), and synced. No more "use `memfs write` CLI" workaround.
+
+Mega's `setup-memfs` target needs no change — existing clones will get 0.12.2 on their next `make setup-memfs`, and the upstream error message surfaces cleanly through the pipe.
+
 ## 2026-04-14 — memfs credential rotation works via `make setup-memfs`
 - Contributed upstream fix to `Haakam21/mem-fs` ([`ccf13fd`](https://github.com/Haakam21/mem-fs/commit/ccf13fd), released as `v0.12.1`): `memfs init` now always prompts for Turso URL/token, and blank input keeps the existing value. Previously init skipped the prompt entirely when `~/.memfs/settings.json` already existed, so piped automation couldn't rotate credentials.
 - No Mega code change needed — `setup-memfs` already pipes `MEMFS_SYNC_URL` / `MEMFS_SYNC_TOKEN` into init's stdin every run. With memfs ≥ 0.12.1, that makes rotation a simple "edit `.env`, run `make setup-memfs`" workflow.
