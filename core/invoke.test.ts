@@ -1,5 +1,12 @@
-import { describe, test, expect } from "bun:test";
-import { toUUID, treeKill, invokeWithHandle } from "./invoke";
+import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import {
+  toUUID,
+  treeKill,
+  invokeWithHandle,
+  isDuplicate,
+  __resetSeenEventsForTests,
+  __seenEventsCountForTests,
+} from "./invoke";
 import { spawn } from "child_process";
 import { join } from "path";
 import { readFileSync, unlinkSync, existsSync } from "fs";
@@ -90,6 +97,58 @@ describe("invokeWithHandle", () => {
 
     const exitCode = await proc.exited;
     expect(exitCode).not.toBe(0);
+  });
+});
+
+describe("isDuplicate / .seen_events rotation", () => {
+  const originalCap = process.env.MEGA_MAX_SEEN_EVENTS;
+
+  beforeEach(() => {
+    __resetSeenEventsForTests();
+    process.env.MEGA_MAX_SEEN_EVENTS = "20";
+  });
+
+  afterEach(() => {
+    __resetSeenEventsForTests();
+    if (originalCap === undefined) delete process.env.MEGA_MAX_SEEN_EVENTS;
+    else process.env.MEGA_MAX_SEEN_EVENTS = originalCap;
+  });
+
+  test("returns false for unseen event ids and true for repeats", () => {
+    expect(isDuplicate("evt-1")).toBe(false);
+    expect(isDuplicate("evt-1")).toBe(true);
+    expect(isDuplicate("evt-2")).toBe(false);
+  });
+
+  test("returns false for empty event id (dedup is opt-in)", () => {
+    expect(isDuplicate("")).toBe(false);
+    expect(isDuplicate("")).toBe(false);
+  });
+
+  test("rotates when the cap is exceeded, dropping the oldest half", () => {
+    // Cap is 20 in this test env. Push 21 distinct events and verify the
+    // set now holds Math.floor(cap/2) = 10 entries (the most recent 10).
+    for (let i = 0; i < 21; i++) {
+      isDuplicate(`evt-${i}`);
+    }
+    expect(__seenEventsCountForTests()).toBe(10);
+    // The oldest 11 should now be considered "unseen" (evicted), so a
+    // re-add returns false.
+    expect(isDuplicate("evt-0")).toBe(false);
+    expect(isDuplicate("evt-10")).toBe(false);
+    // The newest 10 should still be considered seen.
+    expect(isDuplicate("evt-20")).toBe(true);
+    expect(isDuplicate("evt-15")).toBe(true);
+  });
+
+  test("repeated rotations keep the set bounded indefinitely", () => {
+    for (let i = 0; i < 200; i++) {
+      isDuplicate(`evt-${i}`);
+    }
+    // Set should never exceed the cap (20). Worst case it sits between
+    // cap/2+1 and cap.
+    expect(__seenEventsCountForTests()).toBeLessThanOrEqual(20);
+    expect(__seenEventsCountForTests()).toBeGreaterThan(0);
   });
 });
 

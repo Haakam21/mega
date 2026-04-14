@@ -1,5 +1,6 @@
 import { start as startAgentMail } from "./agentmail/channel";
 import { start as startSlack } from "./slack/channel";
+import { startWatchdog } from "./core/watchdog";
 
 console.log("Mega agent harness starting...");
 
@@ -21,3 +22,8 @@ if (channels.length === 0) {
 }
 
 console.log(`Active channels: ${channels.join(", ")}`);
+
+// Belt-and-suspenders for the runaway-process fix set: count claude
+// processes periodically and warn if a leak slips through every other
+// defense layer.
+startWatchdog();

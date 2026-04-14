@@ -52,6 +52,7 @@ mega/
 ├── index.ts           # Entrypoint — starts enabled channels
 ├── core/
 │   ├── invoke.ts      # Shared: dedup, invoke claude, return response
+│   ├── watchdog.ts    # Periodic claude-process count + warn (runaway leak guard)
 │   └── websocket.ts   # Shared: reconnecting WebSocket client
 ├── agentmail/
 │   ├── channel.ts     # AgentMail WebSocket + event handling + reply
@@ -88,16 +89,18 @@ Each channel (email, Slack) follows the same pattern:
 5. `bun run index.ts` starts all configured channels in one process
 
 ### Process Safety
-Claude invocations can hang, spawn long-lived tool subprocesses, or fail silently. The harness protects against runaway processes in four layers:
+Claude invocations can hang, spawn long-lived tool subprocesses, or fail silently. The harness protects against runaway processes in five layers + a watchdog:
 
 - **Per-invocation timeout** — every `runClaude` call has a wall-clock deadline (default 5 min, override with `MEGA_INVOKE_TIMEOUT_MS`). On expiry the process is tree-killed (SIGTERM → SIGKILL after 2s grace) and the invocation resolves to `null`.
 - **Process-group tree kill** — each Claude subprocess is spawned with `detached: true` (new process group). `handle.kill()` and the timeout signal the negative PID (`-pgid`), reaching Claude's Node/MCP/tool descendants, not just the top-level `claude` binary.
 - **`make stop` tree-kills the harness group** — `make start` runs the harness under `setsid` so `harness.pid` holds the PGID. `stop` sends `kill -TERM -- -$pgid`, polls, then SIGKILLs stragglers, plus a belt-and-suspenders `pkill -KILL -f "^claude --print"` for orphans from earlier runs.
-- **Per-channel concurrency cap with interrupt-and-merge** — each channel caps concurrent invocations across threads (Slack via its `activeInvocations` map; AgentMail via `MAX_CONCURRENT_INVOCATIONS`, default 4, override with `MEGA_AGENTMAIL_MAX_CONCURRENT`). New events in an *already-active* thread interrupt the in-flight invocation and merge into a single new one (no new slot used). New events in *new* threads beyond the cap are queued (default 100, override with `MEGA_AGENTMAIL_MAX_QUEUE`); the queue drains as slots free. Excess queued events are dropped with a warning, not silently swallowed.
+- **Per-channel concurrency cap with interrupt-and-merge** — each channel caps concurrent invocations across threads (Slack via its `activeInvocations` map; AgentMail via `MEGA_AGENTMAIL_MAX_CONCURRENT`, default 4, plus a queue capped at `MEGA_AGENTMAIL_MAX_QUEUE`, default 100). New events in an *already-active* thread interrupt the in-flight invocation and merge into a single new one (no new slot used).
+- **Bounded `.seen_events` dedup** — `core/invoke.ts` keeps the dedup window capped at `MEGA_MAX_SEEN_EVENTS` (default 10 000). When the cap is exceeded the oldest half is dropped and the file is rewritten; previously the file grew unbounded and was loaded entirely into memory at startup.
+- **Process-count watchdog** (`core/watchdog.ts`) — every `MEGA_WATCHDOG_INTERVAL_MS` (default 30 s) the harness runs `pgrep -cf "^claude --print"` and warns into `harness.log` if the count exceeds `MEGA_WATCHDOG_THRESHOLD` (default 8). Belt-and-suspenders: catches leaks if every other layer somehow lets one through. Pattern is overridable via `MEGA_WATCHDOG_PATTERN`. The interval timer is `unref()`'d so it never blocks process exit.
 
-Stderr from every Claude invocation is inherited (→ `harness.log`) so hangs and errors are visible instead of silently dropped. Each invocation logs start/exit/kill with PID and duration.
+Stderr from every Claude invocation is inherited (→ `harness.log`) so hangs and errors are visible instead of silently dropped. Every invocation logs `start` / `spawn` / `exit` / `kill` / `timeout` with `session=`, `pid=`, `prompt_bytes=`, `output_bytes=`, and `duration=` fields so operators can correlate harness.log lines back to specific threads when diagnosing a hang.
 
-Testing hooks: `MEGA_CLAUDE_BIN` swaps the binary (defaults to `claude`), used by unit tests to inject `test/mock-claude.sh`, `test/slow-claude.sh`, and `test/tree-claude.sh`. The agentmail channel exports `__resetForTests` and `__stateForTests` so its in-memory queue state can be inspected and cleared between test cases.
+Testing hooks: `MEGA_CLAUDE_BIN` swaps the binary (defaults to `claude`), used by unit tests to inject `test/mock-claude.sh`, `test/slow-claude.sh`, and `test/tree-claude.sh`. The agentmail channel exports `__resetForTests` and `__stateForTests`, and `core/invoke.ts` exports `__resetSeenEventsForTests` and `__seenEventsCountForTests`, so in-memory state can be inspected and cleared between test cases.
 
 ### How Email Works
 1. `agentmail/channel.ts` connects to AgentMail WebSocket and subscribes to the inbox

@@ -2,6 +2,33 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-04-14 — Runaway-process fixes E, G, H: bounded dedup + watchdog + structured invocation logs
+The remaining three follow-ups from the runaway-process plan. The fix set is now complete: A (timeout), B (tree-kill), C (channel concurrency cap), D (make stop tree-kill), E (bounded dedup), F (stderr capture), G (watchdog), H (richer logs).
+
+**E — bounded `.seen_events`** (`core/invoke.ts`)
+- The dedup cache used to grow unbounded and was loaded entirely into memory at startup. After enough events, both the file and the in-memory `Set` would balloon.
+- Now capped at `MEGA_MAX_SEEN_EVENTS` (default 10 000). When the in-memory list exceeds the cap, the oldest half is evicted and the file is rewritten. Most adds are still cheap appendFile; the rotation O(cap) work happens once every ~cap/2 events, not on every event.
+- Initial load truncates to the last `cap` lines from disk so a stale unbounded file from before this fix gets pruned on first startup.
+- New tests (`core/invoke.test.ts`, 4 cases): unseen → false, repeats → true, empty event id → opt-out, rotation drops oldest half, repeated rotations stay bounded indefinitely.
+
+**G — process-count watchdog** (`core/watchdog.ts`, new file)
+- Every `MEGA_WATCHDOG_INTERVAL_MS` (default 30 s) the harness runs `pgrep -cf "^claude --print"` and warns into `harness.log` if the count exceeds `MEGA_WATCHDOG_THRESHOLD` (default 8). Pattern overridable via `MEGA_WATCHDOG_PATTERN` for test isolation.
+- Belt-and-suspenders: if every other defense layer somehow lets a leak through, the watchdog surfaces it before the host dies. Won't tree-kill anything itself; just observability.
+- The interval timer is `unref()`'d so it never blocks process exit. First tick runs immediately on startup so an already-leaked state surfaces fast.
+- New tests (`core/watchdog.test.ts`, 9 cases): real `pgrep` smoke (zero-match, exists-pattern), `watchdogTick` warn semantics (under/at/above threshold, passthrough), `startWatchdog` env overrides + handle stop.
+- Wired into `index.ts` after channel startup.
+
+**H — structured invocation lifecycle logging** (`core/invoke.ts`)
+- Every `[invoke]` log line now includes `session=` and `pid=` fields so operators can correlate harness.log entries to specific threads when diagnosing a hang. The previous logs only had `pid=`, which was useless for cross-referencing once an invocation died.
+- Added structured fields throughout: `prompt_bytes=` on start, `output_bytes=` on exit, `duration=` on exit (was already there), `args=` on spawn (resume vs session-id), explicit `kill` / `timeout` / `grace expired` / `error` / `parse error` events, and a `resume failed → retrying with --session-id` line for the fallback path.
+- Long session ids are truncated to 24 chars + `…` in log lines so they fit on one line and don't leak gratuitously into logs.
+
+Test results: **49/49 unit pass** (was 36 after C), 5 test files. New: `core/watchdog.test.ts`. Updated: `core/invoke.test.ts`. Wired into `make test-unit`.
+
+`CLAUDE.md` Process Safety section now lists all five layers + the watchdog. `core/watchdog.ts` added to the project structure listing.
+
+The runaway-process fix set is **complete**.
+
 ## 2026-04-14 — Runaway-process fix C: AgentMail concurrency cap + interrupt
 The fourth defense layer from the runaway-process plan (after timeout, tree-kill, and group-kill on stop). Closes the "email flood spawns N concurrent invocations" hole.
 
