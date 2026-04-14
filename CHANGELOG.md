@@ -2,6 +2,18 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-04-14 — Runaway-process fix C: AgentMail concurrency cap + interrupt
+The fourth defense layer from the runaway-process plan (after timeout, tree-kill, and group-kill on stop). Closes the "email flood spawns N concurrent invocations" hole.
+
+- `agentmail/channel.ts` rewritten to use `invokeWithHandle` instead of fire-and-forget `invoke`. Per-thread `activeInvocations` map mirrors Slack's pattern: a new email in an already-active thread kills the in-flight invocation and respawns with all accumulated messages merged into a single prompt. No new slot consumed.
+- Global cap: `MEGA_AGENTMAIL_MAX_CONCURRENT` (default 4) limits distinct active threads. Excess events queue up to `MEGA_AGENTMAIL_MAX_QUEUE` (default 100); beyond that they're dropped with a warning. The queue drains automatically as slots free, with the same merge-or-new logic so a queued email whose thread became active mid-wait merges into the active invocation instead of taking a new slot.
+- `buildPrompt(events[])` extracted as a pure function. Single-message inputs render in the legacy `New email received: ...` format; multi-message inputs render numbered `--- Email N ---` blocks with the latest message id called out as the reply target.
+- New `agentmail/channel.test.ts`: 9 unit tests covering single + multi prompt rendering and the queueing state machine (slot allocation, interrupt-and-merge, cap, queue overflow). Test seam via `__resetForTests` + `__stateForTests` keeps the in-memory state inspectable without mocking the actual claude spawn — tests use `MEGA_CLAUDE_BIN=test/slow-claude.sh` so spawned invocations stay running while the test inspects state.
+- `Makefile` wires the new test file into `test-unit`. Total: 36 unit tests, 0 fail (was 27).
+- `CLAUDE.md` Process Safety section now lists four defense layers; "How Email Works" documents the per-thread interrupt and the concurrency env vars.
+
+Now of the runaway-process follow-ups, three remain: **E** (rotate `.seen_events`), **G** (process count watchdog), **H** (richer invocation lifecycle logging).
+
 ## 2026-04-14 — memfs 0.12.4: latent FUSE flush() correctness bug + test isolation
 A `/simplify` review pass on memfs 0.12.2 surfaced (and the follow-up tests caught) two real bugs upstream that shipped as `Haakam21/mem-fs` v0.12.3 + v0.12.4:
 

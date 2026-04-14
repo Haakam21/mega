@@ -88,23 +88,25 @@ Each channel (email, Slack) follows the same pattern:
 5. `bun run index.ts` starts all configured channels in one process
 
 ### Process Safety
-Claude invocations can hang, spawn long-lived tool subprocesses, or fail silently. The harness protects against runaway processes in three layers:
+Claude invocations can hang, spawn long-lived tool subprocesses, or fail silently. The harness protects against runaway processes in four layers:
 
 - **Per-invocation timeout** — every `runClaude` call has a wall-clock deadline (default 5 min, override with `MEGA_INVOKE_TIMEOUT_MS`). On expiry the process is tree-killed (SIGTERM → SIGKILL after 2s grace) and the invocation resolves to `null`.
 - **Process-group tree kill** — each Claude subprocess is spawned with `detached: true` (new process group). `handle.kill()` and the timeout signal the negative PID (`-pgid`), reaching Claude's Node/MCP/tool descendants, not just the top-level `claude` binary.
 - **`make stop` tree-kills the harness group** — `make start` runs the harness under `setsid` so `harness.pid` holds the PGID. `stop` sends `kill -TERM -- -$pgid`, polls, then SIGKILLs stragglers, plus a belt-and-suspenders `pkill -KILL -f "^claude --print"` for orphans from earlier runs.
+- **Per-channel concurrency cap with interrupt-and-merge** — each channel caps concurrent invocations across threads (Slack via its `activeInvocations` map; AgentMail via `MAX_CONCURRENT_INVOCATIONS`, default 4, override with `MEGA_AGENTMAIL_MAX_CONCURRENT`). New events in an *already-active* thread interrupt the in-flight invocation and merge into a single new one (no new slot used). New events in *new* threads beyond the cap are queued (default 100, override with `MEGA_AGENTMAIL_MAX_QUEUE`); the queue drains as slots free. Excess queued events are dropped with a warning, not silently swallowed.
 
 Stderr from every Claude invocation is inherited (→ `harness.log`) so hangs and errors are visible instead of silently dropped. Each invocation logs start/exit/kill with PID and duration.
 
-Testing hooks: `MEGA_CLAUDE_BIN` swaps the binary (defaults to `claude`), used by unit tests to inject `test/mock-claude.sh`, `test/slow-claude.sh`, and `test/tree-claude.sh`.
+Testing hooks: `MEGA_CLAUDE_BIN` swaps the binary (defaults to `claude`), used by unit tests to inject `test/mock-claude.sh`, `test/slow-claude.sh`, and `test/tree-claude.sh`. The agentmail channel exports `__resetForTests` and `__stateForTests` so its in-memory queue state can be inspected and cleared between test cases.
 
 ### How Email Works
 1. `agentmail/channel.ts` connects to AgentMail WebSocket and subscribes to the inbox
-2. When an email arrives, it invokes Claude via `core/invoke.ts`
+2. When an email arrives, it invokes Claude via `core/invoke.ts` using `invokeWithHandle` so the invocation is interruptible
 3. Claude's response is sent as a reply via the AgentMail API
 4. Same email thread = same Claude session (thread ID used as session ID)
 5. Send endpoint: `POST /v0/inboxes/{inbox}/messages/send` with `{to, subject, text}`
 6. Attachments: include `attachments` array with `{content (base64), filename, content_type}`
+7. **Concurrency**: per-thread interrupt-and-merge mirrors Slack — a new email in an already-active thread kills the in-flight invocation and respawns with all messages merged into one prompt. Global cap of `MEGA_AGENTMAIL_MAX_CONCURRENT` (default 4) distinct active threads; excess threads queue up to `MEGA_AGENTMAIL_MAX_QUEUE` (default 100), then drop with a warning. The reply target is always the latest message in the thread.
 
 ### How Slack Works
 1. Create a Slack app at api.slack.com using `slack/manifest.json`
