@@ -1,6 +1,7 @@
 import { start as startAgentMail } from "./agentmail/channel";
 import { start as startSlack } from "./slack/channel";
 import { startWatchdog } from "./core/watchdog";
+import { startLogRotator } from "./core/log-rotator";
 
 console.log("Mega agent harness starting...");
 
@@ -27,3 +28,8 @@ console.log(`Active channels: ${channels.join(", ")}`);
 // processes periodically and warn if a leak slips through every other
 // defense layer.
 startWatchdog();
+
+// Bound harness.log so a long-uptime host doesn't run out of disk waiting
+// for `make stop`. Truncate-in-place every minute when over the cap;
+// `make start`'s O_APPEND redirect makes the truncate actually free disk.
+startLogRotator();

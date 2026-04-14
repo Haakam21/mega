@@ -190,98 +190,89 @@ export async function invoke(options: InvokeOptions): Promise<string | null> {
   return invokeWithHandle(options).promise;
 }
 
-// Invoke with a killable handle (used by Slack channel for interruption)
-export function invokeWithHandle(options: InvokeOptions): InvokeHandle {
-  const { eventId, sessionId, prompt, systemPrompt } = options;
-  // Short session prefix for log lines so the operator can correlate
-  // [invoke] entries to the originating thread without leaking long ids.
-  const sessionTag = sessionId.length > 24 ? sessionId.slice(0, 24) + "…" : sessionId;
-  const promptBytes = Buffer.byteLength(prompt, "utf-8");
+/**
+ * One in-flight Claude invocation. Holds the killable state (the current
+ * child process + a `killed` flag) so the orchestration in `invokeWithHandle`
+ * doesn't need to track them via closures and so each step is a short method
+ * that's easy to skim.
+ */
+class InvocationContext {
+  killed = false;
+  currentProc: ChildProcess | null = null;
+  readonly sessionTag: string;
+  readonly promptBytes: number;
 
-  let killed = false;
-  let currentProc: ChildProcess | null = null;
+  constructor(readonly options: InvokeOptions) {
+    this.sessionTag =
+      options.sessionId.length > 24
+        ? options.sessionId.slice(0, 24) + "…"
+        : options.sessionId;
+    this.promptBytes = Buffer.byteLength(options.prompt, "utf-8");
+  }
 
-  const kill = () => {
-    killed = true;
-    if (currentProc && currentProc.pid) {
-      const pid = currentProc.pid;
-      console.log(`[invoke] kill session=${sessionTag} pid=${pid} — tree-killing`);
-      treeKill(currentProc, "SIGTERM");
-      const proc = currentProc;
-      setTimeout(() => {
-        if (proc.exitCode == null && proc.signalCode == null) {
-          console.log(`[invoke] grace expired session=${sessionTag} pid=${pid} — SIGKILL`);
-          treeKill(proc, "SIGKILL");
-        }
-      }, KILL_GRACE_MS);
-    }
-  };
+  /** Tree-kill the current claude process (if any). Idempotent. */
+  kill(): void {
+    this.killed = true;
+    const proc = this.currentProc;
+    if (!proc?.pid) return;
+    const pid = proc.pid;
+    console.log(`[invoke] kill session=${this.sessionTag} pid=${pid} — tree-killing`);
+    treeKill(proc, "SIGTERM");
+    setTimeout(() => {
+      if (proc.exitCode == null && proc.signalCode == null) {
+        console.log(`[invoke] grace expired session=${this.sessionTag} pid=${pid} — SIGKILL`);
+        treeKill(proc, "SIGKILL");
+      }
+    }, KILL_GRACE_MS);
+  }
 
-  const promise = (async (): Promise<string | null> => {
+  /**
+   * The full invocation flow: dedup → try `--resume` → fall back to
+   * `--session-id`. Bails immediately if the context is killed at any
+   * suspension point.
+   */
+  async run(): Promise<string | null> {
+    const { eventId, sessionId } = this.options;
     if (eventId && isDuplicate(eventId)) {
-      console.log(`[invoke] skip duplicate session=${sessionTag} event=${eventId}`);
+      console.log(`[invoke] skip duplicate session=${this.sessionTag} event=${eventId}`);
       return null;
     }
 
     const uuid = toUUID(sessionId);
 
-    // Try --resume first
-    let response = await runClaude(["--resume", uuid]);
-    if (killed) return null;
+    let response = await this.runClaude(["--resume", uuid]);
+    if (this.killed) return null;
 
-    // Fall back to --session-id
     if (!response) {
-      console.log(`[invoke] resume failed session=${sessionTag} — retrying with --session-id`);
-      response = await runClaude(["--session-id", uuid]);
-      if (killed) return null;
+      console.log(`[invoke] resume failed session=${this.sessionTag} — retrying with --session-id`);
+      response = await this.runClaude(["--session-id", uuid]);
+      if (this.killed) return null;
     }
 
     if (response) {
-      console.log(
-        `[invoke] response session=${sessionTag} chars=${response.length}`
-      );
+      console.log(`[invoke] response session=${this.sessionTag} chars=${response.length}`);
     } else {
-      console.log(`[invoke] no response session=${sessionTag}`);
+      console.log(`[invoke] no response session=${this.sessionTag}`);
     }
-
     return response;
-  })();
+  }
 
-  async function runClaude(sessionArgs: string[]): Promise<string | null> {
-    if (killed) return null;
+  /**
+   * Spawn one `claude` subprocess, set the timeout, capture stdout, and
+   * resolve with the parsed result (or null on any failure). Each spawn is
+   * detached so its process group can be tree-killed by `kill()` or by the
+   * timeout handler — see core/invoke.ts top-of-file `treeKill` for why.
+   */
+  private runClaude(sessionArgs: string[]): Promise<string | null> {
+    if (this.killed) return Promise.resolve(null);
+
+    const proc = this.spawnClaude(sessionArgs);
+    if (!proc) return Promise.resolve(null);
 
     return new Promise<string | null>((resolve) => {
-      const timeoutMs = invokeTimeoutMs();
-      let proc: ChildProcess;
-      try {
-        proc = spawn(
-          claudeBin(),
-          [
-            "--print",
-            "--output-format",
-            "json",
-            "--dangerously-skip-permissions",
-            ...(MEMORIES_REAL_PATH ? ["--add-dir", MEMORIES_REAL_PATH] : []),
-            "--append-system-prompt",
-            systemPrompt,
-            ...sessionArgs,
-            prompt,
-          ],
-          {
-            cwd: ROOT,
-            stdio: ["ignore", "pipe", "inherit"],
-            detached: true,
-          }
-        );
-      } catch (err) {
-        console.error(`[invoke] spawn failed:`, err);
-        resolve(null);
-        return;
-      }
-
-      currentProc = proc;
+      this.currentProc = proc;
       console.log(
-        `[invoke] start session=${sessionTag} pid=${proc.pid} prompt_bytes=${promptBytes} args=${sessionArgs.join(",")}`
+        `[invoke] start session=${this.sessionTag} pid=${proc.pid} prompt_bytes=${this.promptBytes} args=${sessionArgs.join(",")}`
       );
 
       let output = "";
@@ -290,34 +281,16 @@ export function invokeWithHandle(options: InvokeOptions): InvokeHandle {
       });
 
       const startedAt = Date.now();
-      const timeoutTimer = setTimeout(() => {
-        if (proc.exitCode == null && proc.signalCode == null) {
-          console.error(
-            `[invoke] timeout session=${sessionTag} pid=${proc.pid} after=${timeoutMs}ms — tree-killing`
-          );
-          treeKill(proc, "SIGTERM");
-          setTimeout(() => {
-            if (proc.exitCode == null && proc.signalCode == null) {
-              console.error(
-                `[invoke] timeout grace expired session=${sessionTag} pid=${proc.pid} — SIGKILL`
-              );
-              treeKill(proc, "SIGKILL");
-            }
-          }, KILL_GRACE_MS);
-        }
-      }, timeoutMs);
+      const timeoutTimer = this.armTimeout(proc);
 
       const cleanup = () => {
         clearTimeout(timeoutTimer);
-        if (currentProc === proc) currentProc = null;
+        if (this.currentProc === proc) this.currentProc = null;
       };
 
       proc.on("error", (err) => {
         cleanup();
-        console.error(
-          `[invoke] error session=${sessionTag} pid=${proc.pid}:`,
-          err
-        );
+        console.error(`[invoke] error session=${this.sessionTag} pid=${proc.pid}:`, err);
         resolve(null);
       });
 
@@ -325,30 +298,90 @@ export function invokeWithHandle(options: InvokeOptions): InvokeHandle {
         cleanup();
         const durationMs = Date.now() - startedAt;
         console.log(
-          `[invoke] exit session=${sessionTag} pid=${proc.pid} code=${code} signal=${signal} duration=${durationMs}ms output_bytes=${output.length}`
+          `[invoke] exit session=${this.sessionTag} pid=${proc.pid} code=${code} signal=${signal} duration=${durationMs}ms output_bytes=${output.length}`
         );
-
-        if (killed || signal) {
-          resolve(null);
-          return;
-        }
-        if (!output.trim()) {
-          resolve(null);
-          return;
-        }
-        try {
-          const parsed = JSON.parse(output);
-          resolve(parsed.result || null);
-        } catch (err) {
-          console.error(
-            `[invoke] parse error session=${sessionTag} pid=${proc.pid}:`,
-            err
-          );
-          resolve(null);
-        }
+        resolve(this.parseOutput(output, proc));
       });
     });
   }
 
-  return { promise, kill };
+  /** Spawn the claude subprocess. Returns null and logs on spawn failure. */
+  private spawnClaude(sessionArgs: string[]): ChildProcess | null {
+    try {
+      return spawn(
+        claudeBin(),
+        [
+          "--print",
+          "--output-format",
+          "json",
+          "--dangerously-skip-permissions",
+          ...(MEMORIES_REAL_PATH ? ["--add-dir", MEMORIES_REAL_PATH] : []),
+          "--append-system-prompt",
+          this.options.systemPrompt,
+          ...sessionArgs,
+          this.options.prompt,
+        ],
+        {
+          cwd: ROOT,
+          stdio: ["ignore", "pipe", "inherit"],
+          detached: true,
+        }
+      );
+    } catch (err) {
+      console.error(`[invoke] spawn failed session=${this.sessionTag}:`, err);
+      return null;
+    }
+  }
+
+  /**
+   * Schedule a SIGTERM tree-kill if the proc hasn't exited within
+   * `MEGA_INVOKE_TIMEOUT_MS`. Schedules a SIGKILL `KILL_GRACE_MS` after that
+   * if the proc still hasn't exited.
+   */
+  private armTimeout(proc: ChildProcess): NodeJS.Timeout {
+    const timeoutMs = invokeTimeoutMs();
+    return setTimeout(() => {
+      if (proc.exitCode != null || proc.signalCode != null) return;
+      console.error(
+        `[invoke] timeout session=${this.sessionTag} pid=${proc.pid} after=${timeoutMs}ms — tree-killing`
+      );
+      treeKill(proc, "SIGTERM");
+      setTimeout(() => {
+        if (proc.exitCode != null || proc.signalCode != null) return;
+        console.error(
+          `[invoke] timeout grace expired session=${this.sessionTag} pid=${proc.pid} — SIGKILL`
+        );
+        treeKill(proc, "SIGKILL");
+      }, KILL_GRACE_MS);
+    }, timeoutMs);
+  }
+
+  /**
+   * Convert raw claude stdout to the result string. Returns null if the
+   * process was killed, the output is empty, or the JSON failed to parse.
+   * Parse errors are logged but never thrown.
+   */
+  private parseOutput(output: string, proc: ChildProcess): string | null {
+    if (this.killed || proc.signalCode) return null;
+    if (!output.trim()) return null;
+    try {
+      const parsed = JSON.parse(output);
+      return parsed.result || null;
+    } catch (err) {
+      console.error(
+        `[invoke] parse error session=${this.sessionTag} pid=${proc.pid}:`,
+        err
+      );
+      return null;
+    }
+  }
+}
+
+/** Invoke claude with a killable handle. Used by every channel. */
+export function invokeWithHandle(options: InvokeOptions): InvokeHandle {
+  const ctx = new InvocationContext(options);
+  return {
+    promise: ctx.run(),
+    kill: () => ctx.kill(),
+  };
 }

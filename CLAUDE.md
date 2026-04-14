@@ -53,6 +53,7 @@ mega/
 ├── core/
 │   ├── env.ts         # Tiny env-var parsing helpers (parsePositiveInt, etc.)
 │   ├── invoke.ts      # Shared: dedup, invoke claude, return response
+│   ├── log-rotator.ts # Periodic harness.log size cap + truncate-in-place
 │   ├── watchdog.ts    # Periodic claude-process count + warn (runaway leak guard)
 │   └── websocket.ts   # Shared: reconnecting WebSocket client
 ├── agentmail/
@@ -98,6 +99,7 @@ Claude invocations can hang, spawn long-lived tool subprocesses, or fail silentl
 - **Per-channel concurrency cap with interrupt-and-merge** — each channel caps concurrent invocations across threads (Slack via its `activeInvocations` map; AgentMail via `MEGA_AGENTMAIL_MAX_CONCURRENT`, default 4, plus a queue capped at `MEGA_AGENTMAIL_MAX_QUEUE`, default 100). New events in an *already-active* thread interrupt the in-flight invocation and merge into a single new one (no new slot used).
 - **Bounded `.seen_events` dedup** — `core/invoke.ts` keeps the dedup window capped at `MEGA_MAX_SEEN_EVENTS` (default 10 000). When the cap is exceeded the oldest half is dropped and the file is rewritten; previously the file grew unbounded and was loaded entirely into memory at startup.
 - **Process-count watchdog** (`core/watchdog.ts`) — every `MEGA_WATCHDOG_INTERVAL_MS` (default 30 s) the harness runs `pgrep -cf "^claude --print"` and warns into `harness.log` if the count exceeds `MEGA_WATCHDOG_THRESHOLD` (default 8). Belt-and-suspenders: catches leaks if every other layer somehow lets one through. Pattern is overridable via `MEGA_WATCHDOG_PATTERN`. The interval timer is `unref()`'d so it never blocks process exit.
+- **Bounded `harness.log`** (`core/log-rotator.ts`) — every `MEGA_LOG_ROTATE_INTERVAL_MS` (default 60 s) the harness checks `harness.log` size and truncates in place if over `MEGA_LOG_MAX_BYTES` (default 10 MB). `make start` redirects with `>>` (O_APPEND) which is load-bearing: the kernel atomically seeks to end-of-file before each write, so an in-place truncate from inside the harness actually frees disk space. With plain `>`, fd 1 keeps its old offset and subsequent writes create a sparse file with the offset as a hole. Side effect of the `>>` change: history now persists across `make start`/`make stop` instead of being truncated on every restart.
 
 Stderr from every Claude invocation is inherited (→ `harness.log`) so hangs and errors are visible instead of silently dropped. Every invocation logs `start` / `exit` / `kill` / `timeout` with `session=`, `pid=`, `prompt_bytes=`, `output_bytes=`, and `duration=` fields so operators can correlate harness.log lines back to specific threads when diagnosing a hang.
 
@@ -114,6 +116,9 @@ Testing hooks: `MEGA_CLAUDE_BIN` swaps the binary (defaults to `claude`), used b
 | `MEGA_WATCHDOG_INTERVAL_MS` | `30000` | watchdog poll interval |
 | `MEGA_WATCHDOG_THRESHOLD` | `8` | warn when matching process count exceeds this |
 | `MEGA_WATCHDOG_PATTERN` | `^claude --print` | `pgrep -f` pattern for the watchdog |
+| `MEGA_LOG_MAX_BYTES` | `10485760` (10 MB) | rotate `harness.log` when over this size |
+| `MEGA_LOG_ROTATE_INTERVAL_MS` | `60000` | log-rotator poll interval |
+| `MEGA_LOG_PATH` | `<repo>/harness.log` | log file path (test override) |
 | `MEGA_CLAUDE_BIN` | `claude` | path to the Claude binary (test override) |
 | `MEGA_SEEN_EVENTS_PATH` | `<repo>/.seen_events` | dedup file path (test override) |
 

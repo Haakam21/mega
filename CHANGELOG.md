@@ -2,6 +2,28 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-04-14 — Bound harness.log, `make logs`, and refactor `invokeWithHandle`
+Three improvements I'd been deferring:
+
+**Bound harness.log** (`core/log-rotator.ts`, new)
+- `harness.log` was unbounded within a single harness lifetime. On a long-uptime host it could fill the disk before `make stop` ran. Same shape of bug as the pre-fix `.seen_events`.
+- New `core/log-rotator.ts` runs every `MEGA_LOG_ROTATE_INTERVAL_MS` (default 60 s) and truncates `harness.log` in place when it exceeds `MEGA_LOG_MAX_BYTES` (default 10 MB).
+- **`make start` redirect changed from `>` to `>>` (load-bearing)**. Without O_APPEND, in-place truncate doesn't free disk space — the kernel preserves fd 1's offset and subsequent writes create a sparse file with the offset as a hole. With O_APPEND the kernel atomically seeks to end-of-file before each write, so truncate works correctly. Side effect: `harness.log` now persists across `make start`/`make stop` instead of being truncated on every restart, which is also better for "what happened in the previous run" debugging.
+- Wired into `index.ts` next to the watchdog. Initial-tick semantics: rotator checks once on startup so a stale-large file from a previous run gets rotated immediately, not after the first interval.
+- New `core/log-rotator.test.ts`: 7 cases covering `rotateLogIfNeeded` (missing file, under cap, over cap, edge cases at cap and cap+1) and `startLogRotator` (handle stop, initial tick rotates).
+
+**`make logs` target**
+- `tail -F harness.log`. `-F` (capital, follow-by-name) survives the rotator's in-place truncation without skipping a beat.
+
+**`invokeWithHandle` refactored into `InvocationContext` class** (`core/invoke.ts`)
+- The function was ~120 lines doing 4 distinct things via closure-over-state (`killed`, `currentProc`). Each `/simplify` pass kept flagging it for length but extraction wasn't obviously cleaner because it required parameter sprawl.
+- Encapsulated into an `InvocationContext` class: `kill()`, `run()` (the dedup → resume → fallback → log flow), and three private helpers `runClaude` / `spawnClaude` / `armTimeout` / `parseOutput`. `invokeWithHandle` is now a 5-line factory: `new InvocationContext(options); return { promise: ctx.run(), kill: () => ctx.kill() }`.
+- Pure refactor — same behavior, same logs, same tests pass. Each method is short enough to skim.
+
+Tests: **70/70 unit pass** across 7 files (was 63/6). New: `core/log-rotator.test.ts`. `make test-unit` includes it.
+
+`CLAUDE.md` Process Safety section now lists the log-rotator as a defense, env-var matrix gains three rows for `MEGA_LOG_MAX_BYTES` / `MEGA_LOG_ROTATE_INTERVAL_MS` / `MEGA_LOG_PATH`. Project structure listing gains `core/log-rotator.ts`.
+
 ## 2026-04-14 — `/simplify` pass on the runaway-process fix set
 A code review pass on commit `106c4a7` (E + G + H) surfaced one real bug, one privacy violation, and a handful of drift hazards. None affected shipped behavior, but several would have bitten later.
 

@@ -4,7 +4,7 @@
 # that syntax, so recipes silently no-op under the default sh.
 SHELL := /bin/bash
 
-.PHONY: setup setup-deps setup-sessions setup-memfs setup-env setup-github start stop status test test-unit test-e2e
+.PHONY: setup setup-deps setup-sessions setup-memfs setup-env setup-github start stop status logs test test-unit test-e2e
 
 # Agent image setup — run once on a new machine
 setup: setup-deps setup-env setup-sessions setup-memfs setup-github
@@ -88,10 +88,16 @@ setup-github:
 # Start the agent — kills any existing instance first.
 # setsid puts the harness in its own session/process group so `make stop`
 # can tree-kill every claude subprocess by signalling the group.
+#
+# Append-mode redirect (>>) is load-bearing: the harness rotates harness.log
+# from inside via core/log-rotator.ts when it exceeds MEGA_LOG_MAX_BYTES, and
+# in-place truncate only frees disk space when fd 1 has O_APPEND. With plain
+# `>` the kernel keeps the file descriptor's offset across truncates and
+# subsequent writes create a sparse file with the offset as a hole.
 start: stop
 	@echo "Starting agent harness..."
 	@setsid bash -c 'echo $$$$ > harness.pid; exec bun run index.ts' \
-		> harness.log 2>&1 < /dev/null &
+		>> harness.log 2>&1 < /dev/null &
 	@sleep 0.2
 	@echo "Agent harness started (PGID $$(cat harness.pid))"
 
@@ -116,6 +122,11 @@ stop:
 	@rm -f harness.pid
 	@echo "Agent harness stopped."
 
+# Tail the harness log. Follows by name (-F) so it survives the
+# log-rotator's in-place truncation without skipping a beat.
+logs:
+	@tail -F harness.log
+
 # Show agent status
 status:
 	@echo "=== Agent Status ==="
@@ -137,7 +148,7 @@ test: test-unit test-e2e
 
 # Unit tests only
 test-unit:
-	@bun test core/env.test.ts core/invoke.test.ts core/websocket.test.ts core/watchdog.test.ts slack/channel.test.ts agentmail/channel.test.ts
+	@bun test core/env.test.ts core/invoke.test.ts core/log-rotator.test.ts core/watchdog.test.ts core/websocket.test.ts slack/channel.test.ts agentmail/channel.test.ts
 
 # E2E tests (requires harness running + .env configured)
 test-e2e:
