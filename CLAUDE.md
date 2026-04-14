@@ -51,6 +51,7 @@ mega/
 ├── Makefile           # setup / start / stop / test
 ├── index.ts           # Entrypoint — starts enabled channels
 ├── core/
+│   ├── env.ts         # Tiny env-var parsing helpers (parsePositiveInt, etc.)
 │   ├── invoke.ts      # Shared: dedup, invoke claude, return response
 │   ├── watchdog.ts    # Periodic claude-process count + warn (runaway leak guard)
 │   └── websocket.ts   # Shared: reconnecting WebSocket client
@@ -98,9 +99,25 @@ Claude invocations can hang, spawn long-lived tool subprocesses, or fail silentl
 - **Bounded `.seen_events` dedup** — `core/invoke.ts` keeps the dedup window capped at `MEGA_MAX_SEEN_EVENTS` (default 10 000). When the cap is exceeded the oldest half is dropped and the file is rewritten; previously the file grew unbounded and was loaded entirely into memory at startup.
 - **Process-count watchdog** (`core/watchdog.ts`) — every `MEGA_WATCHDOG_INTERVAL_MS` (default 30 s) the harness runs `pgrep -cf "^claude --print"` and warns into `harness.log` if the count exceeds `MEGA_WATCHDOG_THRESHOLD` (default 8). Belt-and-suspenders: catches leaks if every other layer somehow lets one through. Pattern is overridable via `MEGA_WATCHDOG_PATTERN`. The interval timer is `unref()`'d so it never blocks process exit.
 
-Stderr from every Claude invocation is inherited (→ `harness.log`) so hangs and errors are visible instead of silently dropped. Every invocation logs `start` / `spawn` / `exit` / `kill` / `timeout` with `session=`, `pid=`, `prompt_bytes=`, `output_bytes=`, and `duration=` fields so operators can correlate harness.log lines back to specific threads when diagnosing a hang.
+Stderr from every Claude invocation is inherited (→ `harness.log`) so hangs and errors are visible instead of silently dropped. Every invocation logs `start` / `exit` / `kill` / `timeout` with `session=`, `pid=`, `prompt_bytes=`, `output_bytes=`, and `duration=` fields so operators can correlate harness.log lines back to specific threads when diagnosing a hang.
 
-Testing hooks: `MEGA_CLAUDE_BIN` swaps the binary (defaults to `claude`), used by unit tests to inject `test/mock-claude.sh`, `test/slow-claude.sh`, and `test/tree-claude.sh`. The agentmail channel exports `__resetForTests` and `__stateForTests`, and `core/invoke.ts` exports `__resetSeenEventsForTests` and `__seenEventsCountForTests`, so in-memory state can be inspected and cleared between test cases.
+Testing hooks: `MEGA_CLAUDE_BIN` swaps the binary (defaults to `claude`), used by unit tests to inject `test/mock-claude.sh`, `test/slow-claude.sh`, and `test/tree-claude.sh`. `MEGA_SEEN_EVENTS_PATH` redirects the dedup file to a temp path so tests don't pollute the real `.seen_events`. The agentmail channel exports `__resetForTests` / `__stateForTests` and `core/invoke.ts` exports `__resetSeenEventsForTests` / `__seenEventsCountForTests` / `__isDuplicateForTests`, so in-memory state can be inspected and cleared between test cases.
+
+#### Process-safety env vars at a glance
+
+| Var | Default | What it caps |
+|---|---|---|
+| `MEGA_INVOKE_TIMEOUT_MS` | `300000` (5 min) | wall-clock timeout per Claude invocation |
+| `MEGA_MAX_SEEN_EVENTS` | `10000` | dedup window before rotation drops the oldest half |
+| `MEGA_AGENTMAIL_MAX_CONCURRENT` | `4` | distinct active email threads in flight |
+| `MEGA_AGENTMAIL_MAX_QUEUE` | `100` | pending email events when at the cap |
+| `MEGA_WATCHDOG_INTERVAL_MS` | `30000` | watchdog poll interval |
+| `MEGA_WATCHDOG_THRESHOLD` | `8` | warn when matching process count exceeds this |
+| `MEGA_WATCHDOG_PATTERN` | `^claude --print` | `pgrep -f` pattern for the watchdog |
+| `MEGA_CLAUDE_BIN` | `claude` | path to the Claude binary (test override) |
+| `MEGA_SEEN_EVENTS_PATH` | `<repo>/.seen_events` | dedup file path (test override) |
+
+All env vars are parsed via `core/env.ts` (`parsePositiveInt` / `parseNonNegativeInt` / `parseString`) — `0` for a positive-int knob is rejected and falls back to the default rather than silently passing through.
 
 ### How Email Works
 1. `agentmail/channel.ts` connects to AgentMail WebSocket and subscribes to the inbox

@@ -2,6 +2,20 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-04-14 — `/simplify` pass on the runaway-process fix set
+A code review pass on commit `106c4a7` (E + G + H) surfaced one real bug, one privacy violation, and a handful of drift hazards. None affected shipped behavior, but several would have bitten later.
+
+- **Real bug, fixed in passing**: `agentmail/channel.ts` parsed env vars via `parseInt(...) \|\| DEFAULT`, which silently swapped a configured `0` for the default. New `core/env.ts` module exports `parsePositiveInt` / `parseNonNegativeInt` / `parseString`; `parsePositiveInt` rejects `0` by definition. All five call sites in `core/` and `agentmail/` migrated. The pattern was duplicated enough that extraction was a real reuse win regardless.
+- **`BoundedFifoSet`**: `core/invoke.ts` had a `seenList: string[]` and `seenEvents: Set<string>` mutated by hand in three places. One forgotten update would silently break dedup. Extracted into a small class with a single `add()` that returns evicted items so the caller (here, `isDuplicate`) can mirror rotation in any out-of-band storage. Cap is passed per-add so the `MEGA_MAX_SEEN_EVENTS` env override stays live.
+- **`isDuplicate` back to private**: was promoted to public solely to test it. Tests now go through `__isDuplicateForTests` (clearly marked test seam) so the public surface stays free of test-only exports.
+- **Sync rotation**: the rare rotation path now uses `writeFileSync` instead of `writeFile`. Eliminates an unordered-async race where two close-together rotations could interleave on disk. Per-event `appendFile` stays async.
+- **`watchdogTick` split**: was three positional optionals, all defaulting to env reads. Production always passed all-default; tests always passed all-concrete. Split into `evaluateWatchdog(count, threshold, pattern)` (pure, tested) + `watchdogTick()` (env+pgrep glue). Test file no longer needs `pgrep` mocks or magic sleeps.
+- **Test isolation for `.seen_events`**: new `MEGA_SEEN_EVENTS_PATH` env var so tests can point dedup at a per-pid temp file in `/tmp` instead of polluting the project's real `.seen_events`. `__resetSeenEventsForTests` also unlinks the temp file.
+- **Less log noise on the happy path**: dropped the redundant `[invoke] start session=… uuid=…` line in favor of one `[invoke] start session=… pid=… prompt_bytes=… args=…` emitted from inside the spawn closure. Half the log volume per invocation.
+- **Test cleanup**: dropped the magic 150 ms `setTimeout` in the watchdog env-overrides test (the initial tick fires synchronously inside `startWatchdog`, so the spy can be asserted immediately). Replaced a tautological `expect(count >= 0)` smoke test with a meaningful `expect(count > 0)` against `bun` (guaranteed to match the test runner).
+
+Tests: **48/48 unit pass** across 5 files. Net count is one fewer than the previous 49 because the tautological test is gone, not because anything regressed.
+
 ## 2026-04-14 — Runaway-process fixes E, G, H: bounded dedup + watchdog + structured invocation logs
 The remaining three follow-ups from the runaway-process plan. The fix set is now complete: A (timeout), B (tree-kill), C (channel concurrency cap), D (make stop tree-kill), E (bounded dedup), F (stderr capture), G (watchdog), H (richer logs).
 
