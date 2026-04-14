@@ -1,10 +1,17 @@
-import { existsSync, readFileSync, appendFile, writeFile, realpathSync } from "fs";
+import {
+  existsSync,
+  readFileSync,
+  appendFile,
+  writeFileSync,
+  unlinkSync,
+  realpathSync,
+} from "fs";
 import { createHash } from "crypto";
 import { join } from "path";
 import { spawn, type ChildProcess } from "child_process";
+import { parsePositiveInt, parseString } from "./env";
 
 const ROOT = join(import.meta.dir, "..");
-const SEEN_FILE = join(ROOT, ".seen_events");
 const MEMORIES_SYMLINK = join(ROOT, "memories");
 
 // Cap the dedup window. Webhook deduplication only needs to remember events
@@ -12,10 +19,13 @@ const MEMORIES_SYMLINK = join(ROOT, "memories");
 // so a generous fixed cap is more than enough — and bounded forever, unlike
 // the previous unbounded grow-and-load-at-startup behavior.
 const DEFAULT_MAX_SEEN_EVENTS = 10_000;
-function maxSeenEvents(): number {
-  const raw = parseInt(process.env.MEGA_MAX_SEEN_EVENTS ?? "", 10);
-  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MAX_SEEN_EVENTS;
-}
+const maxSeenEvents = () =>
+  parsePositiveInt("MEGA_MAX_SEEN_EVENTS", DEFAULT_MAX_SEEN_EVENTS);
+
+// Test seam: lets unit tests redirect the dedup file to a temp path so they
+// don't pollute the project's real .seen_events between runs.
+const seenFilePath = () =>
+  parseString("MEGA_SEEN_EVENTS_PATH", join(ROOT, ".seen_events"));
 
 // Resolve the memories symlink to the real path (FUSE mount)
 // Claude's tools don't follow symlinks into FUSE mounts, so we need --add-dir
@@ -27,14 +37,9 @@ const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
 const KILL_GRACE_MS = 2000;
 
 // Read lazily so tests can override via env between calls.
-function claudeBin(): string {
-  return process.env.MEGA_CLAUDE_BIN || "claude";
-}
-
-function invokeTimeoutMs(): number {
-  const raw = parseInt(process.env.MEGA_INVOKE_TIMEOUT_MS ?? "", 10);
-  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_TIMEOUT_MS;
-}
+const claudeBin = () => parseString("MEGA_CLAUDE_BIN", "claude");
+const invokeTimeoutMs = () =>
+  parsePositiveInt("MEGA_INVOKE_TIMEOUT_MS", DEFAULT_TIMEOUT_MS);
 
 // Send a signal to the entire process group of `proc`, falling back to the
 // single process if the group signal fails. `proc` must have been spawned with
@@ -70,43 +75,102 @@ export function toUUID(input: string): string {
   ].join("-");
 }
 
-// Load persisted seen events into memory. We keep both a Set (for O(1)
-// dedup lookups) and a parallel ordered list (so we can drop the oldest
-// when the cap is exceeded). They're kept in sync inside `isDuplicate`.
-const initialSeen = existsSync(SEEN_FILE)
-  ? readFileSync(SEEN_FILE, "utf-8").split("\n").filter(Boolean)
-  : [];
-let seenList: string[] = initialSeen.slice(-maxSeenEvents());
-const seenEvents = new Set<string>(seenList);
+// FIFO set with a hard cap. When the cap is exceeded, the oldest half is
+// evicted in one O(cap) splice (rare — once per ~cap/2 inserts) and the
+// caller is told what was dropped so it can reflect the same eviction in
+// any out-of-band storage (e.g. the on-disk dedup log).
+//
+// Keeping the parallel `Set` and `list` mutations behind one `add()` method
+// removes the drift risk that comes with maintaining them by hand. The cap
+// is passed into `add` rather than captured at construction so the
+// underlying env var override stays live (tests rely on this).
+class BoundedFifoSet {
+  private set: Set<string>;
+  private list: string[];
 
-export function isDuplicate(eventId: string): boolean {
+  constructor(initial: string[], initialCap: number) {
+    this.list = initial.slice(-initialCap);
+    this.set = new Set(this.list);
+  }
+
+  has(item: string): boolean {
+    return this.set.has(item);
+  }
+
+  /**
+   * Insert `item` with a cap policy. Returns whether it was newly added,
+   * plus any items evicted by the bounded-cap policy. `evicted` is
+   * non-empty only on the rare rotation tick.
+   */
+  add(item: string, cap: number): { added: boolean; evicted: string[] } {
+    if (this.set.has(item)) return { added: false, evicted: [] };
+    this.set.add(item);
+    this.list.push(item);
+    if (this.list.length <= cap) return { added: true, evicted: [] };
+    const dropCount = this.list.length - Math.floor(cap / 2);
+    const evicted = this.list.splice(0, dropCount);
+    for (const e of evicted) this.set.delete(e);
+    return { added: true, evicted };
+  }
+
+  size(): number {
+    return this.list.length;
+  }
+
+  toArray(): readonly string[] {
+    return this.list;
+  }
+
+  clear(): void {
+    this.set.clear();
+    this.list = [];
+  }
+}
+
+const initialSeen = (() => {
+  const path = seenFilePath();
+  if (!existsSync(path)) return [];
+  return readFileSync(path, "utf-8").split("\n").filter(Boolean);
+})();
+
+const seen = new BoundedFifoSet(initialSeen, maxSeenEvents());
+
+function isDuplicate(eventId: string): boolean {
   if (!eventId) return false;
-  if (seenEvents.has(eventId)) return true;
-  seenEvents.add(eventId);
-  seenList.push(eventId);
-  const cap = maxSeenEvents();
-  if (seenList.length > cap) {
-    // Drop the oldest half. Rewriting the file is O(cap) but rare —
-    // happens once every ~cap/2 events, not on every append.
-    const dropCount = seenList.length - Math.floor(cap / 2);
-    const dropped = seenList.splice(0, dropCount);
-    for (const e of dropped) seenEvents.delete(e);
-    writeFile(SEEN_FILE, seenList.join("\n") + "\n", () => {});
+  if (seen.has(eventId)) return true;
+  const { evicted } = seen.add(eventId, maxSeenEvents());
+  if (evicted.length > 0) {
+    // Rotation: rewrite the whole file synchronously. Sync write avoids the
+    // unordered-async race where two close-together rotations interleave on
+    // disk; it's O(cap) but fires once per ~cap/2 inserts so amortized cost
+    // is negligible.
+    writeFileSync(seenFilePath(), seen.toArray().join("\n") + "\n");
   } else {
-    appendFile(SEEN_FILE, eventId + "\n", () => {});
+    appendFile(seenFilePath(), eventId + "\n", () => {});
   }
   return false;
 }
 
-// Test seam: lets unit tests reset and inspect the dedup state without
-// touching the filesystem. Not part of the public surface.
+// Test seams: not part of the public surface. Tests call these to reset and
+// inspect the dedup state without going through the public invoke path.
 export function __resetSeenEventsForTests(): void {
-  seenList = [];
-  seenEvents.clear();
+  seen.clear();
+  const path = seenFilePath();
+  if (existsSync(path)) {
+    try {
+      unlinkSync(path);
+    } catch {
+      // best-effort
+    }
+  }
 }
 
 export function __seenEventsCountForTests(): number {
-  return seenList.length;
+  return seen.size();
+}
+
+export function __isDuplicateForTests(eventId: string): boolean {
+  return isDuplicate(eventId);
 }
 
 export interface InvokeOptions {
@@ -160,9 +224,6 @@ export function invokeWithHandle(options: InvokeOptions): InvokeHandle {
     }
 
     const uuid = toUUID(sessionId);
-    console.log(
-      `[invoke] start session=${sessionTag} uuid=${uuid} prompt_bytes=${promptBytes}`
-    );
 
     // Try --resume first
     let response = await runClaude(["--resume", uuid]);
@@ -220,7 +281,7 @@ export function invokeWithHandle(options: InvokeOptions): InvokeHandle {
 
       currentProc = proc;
       console.log(
-        `[invoke] spawn session=${sessionTag} pid=${proc.pid} args=${sessionArgs.join(",")}`
+        `[invoke] start session=${sessionTag} pid=${proc.pid} prompt_bytes=${promptBytes} args=${sessionArgs.join(",")}`
       );
 
       let output = "";

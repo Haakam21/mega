@@ -1,16 +1,25 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { join } from "path";
+import { tmpdir } from "os";
+
+// Point dedup state at a per-pid temp file so tests don't pollute the real
+// project's .seen_events between runs. Must be set before importing the
+// module (constants are captured at module load).
+process.env.MEGA_SEEN_EVENTS_PATH = join(
+  tmpdir(),
+  `mega-test-seen-${process.pid}.txt`
+);
+
 import {
   toUUID,
   treeKill,
   invokeWithHandle,
-  isDuplicate,
+  __isDuplicateForTests as isDuplicate,
   __resetSeenEventsForTests,
   __seenEventsCountForTests,
 } from "./invoke";
 import { spawn } from "child_process";
-import { join } from "path";
 import { readFileSync, unlinkSync, existsSync } from "fs";
-import { tmpdir } from "os";
 
 const isAlive = (pid: number): boolean => {
   try {

@@ -1,5 +1,6 @@
 import { invokeWithHandle, type InvokeHandle } from "../core/invoke";
 import { connectWebSocket } from "../core/websocket";
+import { parsePositiveInt } from "../core/env";
 
 const API = "https://api.agentmail.to/v0";
 const apiKey = process.env.AGENTMAIL_API_KEY!;
@@ -15,10 +16,13 @@ const SYSTEM_PROMPT =
 // caps that parallelism. Excess events queue (up to MAX_QUEUE_LENGTH) until a
 // slot frees. New emails in an already-active thread *interrupt and merge*
 // instead of taking a slot.
-const MAX_CONCURRENT_INVOCATIONS =
-  parseInt(process.env.MEGA_AGENTMAIL_MAX_CONCURRENT ?? "", 10) || 4;
-const MAX_QUEUE_LENGTH =
-  parseInt(process.env.MEGA_AGENTMAIL_MAX_QUEUE ?? "", 10) || 100;
+//
+// Read at module load — restart the harness to pick up new values.
+const MAX_CONCURRENT_INVOCATIONS = parsePositiveInt(
+  "MEGA_AGENTMAIL_MAX_CONCURRENT",
+  4
+);
+const MAX_QUEUE_LENGTH = parsePositiveInt("MEGA_AGENTMAIL_MAX_QUEUE", 100);
 
 interface ActiveInvocation {
   handle: InvokeHandle;
