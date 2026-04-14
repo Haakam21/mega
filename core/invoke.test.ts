@@ -1,6 +1,31 @@
 import { describe, test, expect } from "bun:test";
-import { toUUID } from "./invoke";
+import { toUUID, treeKill, invokeWithHandle } from "./invoke";
+import { spawn } from "child_process";
 import { join } from "path";
+import { readFileSync, unlinkSync, existsSync } from "fs";
+import { tmpdir } from "os";
+
+const isAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const waitUntil = async (
+  predicate: () => boolean,
+  timeoutMs: number,
+  intervalMs = 50
+): Promise<boolean> => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  return predicate();
+};
 
 describe("toUUID", () => {
   test("produces valid UUID format", () => {
@@ -66,4 +91,189 @@ describe("invokeWithHandle", () => {
     const exitCode = await proc.exited;
     expect(exitCode).not.toBe(0);
   });
+});
+
+describe("treeKill", () => {
+  const treeClaude = join(import.meta.dir, "..", "test", "tree-claude.sh");
+
+  test("kills child processes via process group", async () => {
+    const childPidFile = join(tmpdir(), `mega-tree-kill-${Date.now()}.pid`);
+    if (existsSync(childPidFile)) unlinkSync(childPidFile);
+
+    const proc = spawn("bash", [treeClaude], {
+      stdio: ["ignore", "ignore", "ignore"],
+      detached: true,
+      env: { ...process.env, TREE_CHILD_PID_FILE: childPidFile },
+    });
+
+    // Wait for the child process to be spawned and recorded.
+    const recorded = await waitUntil(() => existsSync(childPidFile), 3000);
+    expect(recorded).toBe(true);
+    const childPid = parseInt(readFileSync(childPidFile, "utf-8").trim(), 10);
+    expect(Number.isFinite(childPid)).toBe(true);
+
+    // Child should be alive before the kill.
+    expect(isAlive(childPid)).toBe(true);
+
+    const sent = treeKill(proc, "SIGKILL");
+    expect(sent).toBe(true);
+
+    const reaped = await waitUntil(() => !isAlive(childPid), 2000);
+    expect(reaped).toBe(true);
+
+    unlinkSync(childPidFile);
+  });
+});
+
+describe("invokeWithHandle integration", () => {
+  const slowClaude = join(import.meta.dir, "..", "test", "slow-claude.sh");
+  const treeClaude = join(import.meta.dir, "..", "test", "tree-claude.sh");
+  const mockClaude = join(import.meta.dir, "..", "test", "mock-claude.sh");
+
+  const withEnv = async <T>(
+    overrides: Record<string, string | undefined>,
+    fn: () => Promise<T>
+  ): Promise<T> => {
+    const previous: Record<string, string | undefined> = {};
+    for (const key of Object.keys(overrides)) previous[key] = process.env[key];
+    try {
+      for (const [key, val] of Object.entries(overrides)) {
+        if (val === undefined) delete process.env[key];
+        else process.env[key] = val;
+      }
+      return await fn();
+    } finally {
+      for (const [key, val] of Object.entries(previous)) {
+        if (val === undefined) delete process.env[key];
+        else process.env[key] = val;
+      }
+    }
+  };
+
+  test(
+    "returns mock claude's JSON result",
+    async () => {
+      const result = await withEnv(
+        {
+          MEGA_CLAUDE_BIN: mockClaude,
+          MEGA_INVOKE_TIMEOUT_MS: "5000",
+        },
+        () =>
+          invokeWithHandle({
+            sessionId: `test-mock-${Date.now()}`,
+            prompt: "hello from test",
+            systemPrompt: "test",
+          }).promise
+      );
+
+      expect(result).toContain("mock response to:");
+    },
+    10000
+  );
+
+  test(
+    "times out and kills a hung claude process",
+    async () => {
+      const started = Date.now();
+      const result = await withEnv(
+        {
+          MEGA_CLAUDE_BIN: slowClaude,
+          MEGA_INVOKE_TIMEOUT_MS: "300",
+        },
+        () =>
+          invokeWithHandle({
+            sessionId: `test-timeout-${Date.now()}`,
+            prompt: "hello",
+            systemPrompt: "test",
+          }).promise
+      );
+      const elapsed = Date.now() - started;
+
+      // Timeout fires → runClaude returns null → fallback --session-id path
+      // runs and also times out → whole invocation yields null.
+      expect(result).toBeNull();
+      // Should be well under slow-claude's 10s sleep, even counting both
+      // timeouts + grace periods.
+      expect(elapsed).toBeLessThan(8000);
+    },
+    15000
+  );
+
+  test(
+    "handle.kill() terminates an in-flight invocation quickly",
+    async () => {
+      await withEnv(
+        {
+          MEGA_CLAUDE_BIN: slowClaude,
+          MEGA_INVOKE_TIMEOUT_MS: "60000",
+        },
+        async () => {
+          const handle = invokeWithHandle({
+            sessionId: `test-kill-${Date.now()}`,
+            prompt: "hello",
+            systemPrompt: "test",
+          });
+          // Let the spawn happen.
+          await new Promise((r) => setTimeout(r, 250));
+          const started = Date.now();
+          handle.kill();
+          const result = await handle.promise;
+          const elapsed = Date.now() - started;
+          expect(result).toBeNull();
+          // Should be nowhere near slow-claude's 10s sleep.
+          expect(elapsed).toBeLessThan(4000);
+        }
+      );
+    },
+    15000
+  );
+
+  test(
+    "handle.kill() tree-kills claude's child subprocesses",
+    async () => {
+      const childPidFile = join(
+        tmpdir(),
+        `mega-invoke-tree-kill-${Date.now()}.pid`
+      );
+      if (existsSync(childPidFile)) unlinkSync(childPidFile);
+
+      await withEnv(
+        {
+          MEGA_CLAUDE_BIN: treeClaude,
+          MEGA_INVOKE_TIMEOUT_MS: "60000",
+          TREE_CHILD_PID_FILE: childPidFile,
+        },
+        async () => {
+          const handle = invokeWithHandle({
+            sessionId: `test-tree-${Date.now()}`,
+            prompt: "hello",
+            systemPrompt: "test",
+          });
+
+          // Wait for the grandchild PID to be recorded by the mock.
+          const recorded = await waitUntil(
+            () => existsSync(childPidFile),
+            3000
+          );
+          expect(recorded).toBe(true);
+          const childPid = parseInt(
+            readFileSync(childPidFile, "utf-8").trim(),
+            10
+          );
+          expect(isAlive(childPid)).toBe(true);
+
+          handle.kill();
+          const result = await handle.promise;
+          expect(result).toBeNull();
+
+          // Grandchild (sleep 300) should be reaped by the group kill.
+          const reaped = await waitUntil(() => !isAlive(childPid), 3000);
+          expect(reaped).toBe(true);
+        }
+      );
+
+      if (existsSync(childPidFile)) unlinkSync(childPidFile);
+    },
+    15000
+  );
 });

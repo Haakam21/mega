@@ -25,44 +25,62 @@ make start              # Start the email listener
 
 ```bash
 make setup    # First-time setup (deps, memfs, env validation)
-make start    # Start the agent (kills any existing instances first)
-make stop     # Stop the agent
+make start    # Start the agent (tree-kills any existing instances first)
+make stop     # Stop the agent (tree-kills the whole process group,
+              # including any in-flight Claude subprocesses)
 make status   # Show agent status
 ```
+
+`make stop` signals the harness's process group, so Claude invocations and their tool subprocesses are reaped together. Every invocation also has a wall-clock timeout (default 5 min, override with `MEGA_INVOKE_TIMEOUT_MS`) that tree-kills on expiry. See `CLAUDE.md` → "Process Safety" for the full story.
 
 ## Dependencies
 
 - [Claude Code](https://claude.ai/code) — the agent
-- [Node.js](https://nodejs.org) — WebSocket client
-- [jq](https://jqlang.github.io/jq/) — JSON parsing
-- [curl](https://curl.se) — HTTP requests
-- [memfs](https://memfs.io) — shared memory across instances
+- [Bun](https://bun.sh) — TypeScript runtime, WebSocket client, test runner
+- [gh](https://cli.github.com) — GitHub CLI for PR review
+- [jq](https://jqlang.github.io/jq/) — checked by `make setup` (legacy dep)
+- [memfs](https://github.com/Haakam21/mem-fs) — shared memory across instances
+
+`make setup` verifies each of these before running any configuration steps.
 
 ## Configuration
 
-All secrets live in `.env` (gitignored):
+All secrets live in `.env` (gitignored). `MEMFS_*` and `GITHUB_TOKEN` are required. At least one channel (AgentMail or Slack) must be configured; each is independently optional:
 
 ```
+# Required
 MEMFS_SYNC_URL=         # Turso database URL for memory sync
 MEMFS_SYNC_TOKEN=       # Turso auth token
+GITHUB_TOKEN=           # GitHub PAT for code review
+
+# AgentMail (optional — leave blank to disable)
 AGENTMAIL_API_KEY=      # AgentMail API key
 AGENTMAIL_INBOX_ID=     # Agent's email address (e.g., name@agentmail.to)
+
+# Slack (optional — leave blank to disable)
+SLACK_BOT_TOKEN=        # xoxb-... Bot User OAuth Token
+SLACK_APP_TOKEN=        # xapp-... App-Level Token with connections:write
 ```
 
 ## Architecture
 
+Bun/TypeScript harness (`index.ts`) starts whichever channels are configured. Each channel opens a WebSocket, dedupes events, invokes Claude Code with full tool access and session continuity, then sends the response back via its own API.
+
 ```
-Email arrives → AgentMail WebSocket → ws.js → listener.sh → claude --print → reply sent
+Event (email/DM/mention) → channel WebSocket → core/invoke.ts → claude --print → reply sent
 ```
 
-- `agentmail/ws.js` — Node.js WebSocket client, prints events to stdout
-- `agentmail/listener.sh` — Reads events, invokes Claude Code, sends replies
-- `agentmail/test.sh` — End-to-end test (sends email, verifies reply + session continuity)
+- `agentmail/channel.ts` — AgentMail WebSocket subscriber + reply sender
+- `slack/channel.ts` — Slack Socket Mode subscriber + reply sender
+- `core/invoke.ts` — Shared: dedup, invoke Claude, return response
+- `core/websocket.ts` — Shared: reconnecting WebSocket client
+
+See `CLAUDE.md` for the full project structure and channel details.
 
 ## Testing
 
 ```bash
-bash agentmail/test.sh
+make test        # unit + E2E
+make test-unit   # unit tests only
+make test-e2e    # E2E (AgentMail test auto-skips if AGENTMAIL_API_KEY is blank)
 ```
-
-Sends a test email, invokes Claude, verifies the reply, then sends a follow-up to confirm session continuity.

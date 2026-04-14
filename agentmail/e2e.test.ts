@@ -3,6 +3,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 const API = "https://api.agentmail.to/v0";
 const apiKey = process.env.AGENTMAIL_API_KEY!;
 const inboxId = process.env.AGENTMAIL_INBOX_ID!;
+const agentmailDisabled = !apiKey || !inboxId;
 const headers = {
   Authorization: `Bearer ${apiKey}`,
   "Content-Type": "application/json",
@@ -35,12 +36,8 @@ async function poll(
   throw new Error("Poll timed out");
 }
 
-describe("AgentMail E2E", () => {
+describe.skipIf(agentmailDisabled)("AgentMail E2E", () => {
   beforeAll(async () => {
-    if (!apiKey || !inboxId) {
-      throw new Error("AGENTMAIL_API_KEY and AGENTMAIL_INBOX_ID required");
-    }
-
     // Create a test sender inbox
     const sender = await api("/inboxes", {
       method: "POST",

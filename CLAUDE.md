@@ -36,7 +36,9 @@ This repo is a portable agent image. Clone it, run `make setup`, get a running d
 
 - **Claude Code** is the agent — all reasoning and action
 - **memfs** provides shared memory across all instances
-- **AgentMail WebSocket** pushes email events in real-time, triggering Claude Code
+- **Channels** are independently optional; at least one must be configured in `.env`. Each runs only if its env vars are set.
+    - **AgentMail** (`AGENTMAIL_API_KEY`, `AGENTMAIL_INBOX_ID`) — pushes email events in real-time via WebSocket
+    - **Slack** (`SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`) — pushes DM/mention events in real-time via Socket Mode
 - **GitHub CLI (`gh`)** enables code review on GitHub PRs
 - **Bun** is the runtime — TypeScript, WebSocket, fetch, and subprocess all built-in
 - **No runtime dependencies beyond bun, jq, gh, and claude**
@@ -60,7 +62,8 @@ mega/
 │   └── manifest.json  # Slack app manifest — paste into api.slack.com
 ├── test/
 │   ├── mock-claude.sh  # Mock claude CLI for unit tests
-│   └── slow-claude.sh  # Slow mock for kill/interrupt tests
+│   ├── slow-claude.sh  # Slow mock for kill/interrupt tests
+│   └── tree-claude.sh  # Mock that spawns a child subprocess (tree-kill tests)
 ├── .env.example       # Template for secrets
 ├── .env               # Secrets (gitignored)
 ├── .gitignore
@@ -83,6 +86,17 @@ Each channel (email, Slack) follows the same pattern:
 3. `invoke.ts` calls `claude --print` with full tool access (`--dangerously-skip-permissions`), session continuity (`--resume`/`--session-id`), and `cwd` set to project root so CLAUDE.md and memories are available
 4. Channel sends the response back via its own API
 5. `bun run index.ts` starts all configured channels in one process
+
+### Process Safety
+Claude invocations can hang, spawn long-lived tool subprocesses, or fail silently. The harness protects against runaway processes in three layers:
+
+- **Per-invocation timeout** — every `runClaude` call has a wall-clock deadline (default 5 min, override with `MEGA_INVOKE_TIMEOUT_MS`). On expiry the process is tree-killed (SIGTERM → SIGKILL after 2s grace) and the invocation resolves to `null`.
+- **Process-group tree kill** — each Claude subprocess is spawned with `detached: true` (new process group). `handle.kill()` and the timeout signal the negative PID (`-pgid`), reaching Claude's Node/MCP/tool descendants, not just the top-level `claude` binary.
+- **`make stop` tree-kills the harness group** — `make start` runs the harness under `setsid` so `harness.pid` holds the PGID. `stop` sends `kill -TERM -- -$pgid`, polls, then SIGKILLs stragglers, plus a belt-and-suspenders `pkill -KILL -f "^claude --print"` for orphans from earlier runs.
+
+Stderr from every Claude invocation is inherited (→ `harness.log`) so hangs and errors are visible instead of silently dropped. Each invocation logs start/exit/kill with PID and duration.
+
+Testing hooks: `MEGA_CLAUDE_BIN` swaps the binary (defaults to `claude`), used by unit tests to inject `test/mock-claude.sh`, `test/slow-claude.sh`, and `test/tree-claude.sh`.
 
 ### How Email Works
 1. `agentmail/channel.ts` connects to AgentMail WebSocket and subscribes to the inbox
@@ -108,9 +122,9 @@ Each channel (email, Slack) follows the same pattern:
 
 ### Testing
 - `make test` — run all tests (unit + E2E)
-- `make test-unit` — unit tests only (invoke, websocket, buildPrompt)
-- `make test-e2e` — E2E tests (requires harness running via `make start`)
-- Tests use Bun's built-in test runner (`bun test`)
+- `make test-unit` — unit tests only (invoke + treeKill + invokeWithHandle integration, websocket, buildPrompt)
+- `make test-e2e` — E2E tests (requires harness running via `make start`; AgentMail e2e auto-skips if `AGENTMAIL_API_KEY` is blank)
+- Tests use Bun's built-in test runner (`bun test`). Integration tests inject mock binaries via `MEGA_CLAUDE_BIN`.
 
 ## Rules
 
@@ -118,3 +132,5 @@ Each channel (email, Slack) follows the same pattern:
 - Every self-modification gets a changelog entry.
 - When in doubt about Haakam's preferences, ask — don't guess.
 - Portable across macOS and Linux.
+
+Your memories are in the ./memories directory. At the start of every session, check them for anything relevant. Use `search "query"` to find memories by meaning. Save important things you learn to memory. At the end of every session, write a summary of what you did and decided to ./memories/sessions/.
