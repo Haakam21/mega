@@ -52,6 +52,7 @@ mega/
 ├── index.ts           # Entrypoint — starts enabled channels
 ├── core/
 │   ├── env.ts         # Tiny env-var parsing helpers (parsePositiveInt, etc.)
+│   ├── interval.ts    # startInterval(tick, ms) — shared by watchdog + log-rotator
 │   ├── invoke.ts      # Shared: dedup, invoke claude, return response
 │   ├── log-rotator.ts # Periodic harness.log size cap + truncate-in-place
 │   ├── watchdog.ts    # Periodic claude-process count + warn (runaway leak guard)

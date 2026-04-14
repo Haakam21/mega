@@ -2,6 +2,25 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-04-14 — `/simplify` pass on log-rotator + `InvocationContext`
+A code review pass on commit `05822f8` surfaced one regression and a handful of cleanups.
+
+**Regression fix**: `core/log-rotator.ts` `rotateLogIfNeeded` was re-introducing the exact default-arg-from-env pattern the previous `/simplify` pass had killed for `watchdogTick`. Tests had to set env vars to drive it. Split into `rotateLogIfNeeded(path, cap)` (pure, two args) + `logRotatorTick()` (env-reading wrapper). Mirrors the `evaluateWatchdog` + `watchdogTick` split exactly.
+
+**Reuse extractions**:
+- New `core/interval.ts` with `startInterval(tick, ms): IntervalHandle`. Both `startWatchdog` and `startLogRotator` had identical "initial tick + setInterval + unref + return handle" boilerplate. Now a 4-line shared helper, both call sites use it. Deleted the duplicate `WatchdogHandle`/`LogRotatorHandle` types in favor of the shared `IntervalHandle`. New `core/interval.test.ts` (3 cases).
+- `core/invoke.ts` `InvocationContext.treeKillWithGrace(proc, reason, asError)` — extracted from the duplicate SIGTERM-then-grace-then-SIGKILL ladder in `kill()` and `armTimeout()`. The two sites differed only in log prefix (`kill` vs `timeout`) and severity (`log` vs `error`). Caller still emits the initial log line; the helper handles the SIGTERM/grace/SIGKILL plumbing.
+
+**Quality fixes**:
+- `runClaude` is now `async` instead of returning `Promise<string|null>` with explicit `Promise.resolve(null)` early-outs.
+- `killed` and `currentProc` on `InvocationContext` are now `private`.
+- `spawnClaude` lost its WHAT-narration JSDoc.
+- `parseOutput` got a one-line WHY note explaining `proc.signalCode` semantics.
+
+**Efficiency fix**: `rotateLogIfNeeded` dropped the `existsSync(path)` prelude. `statSync` already throws `ENOENT` and the surrounding `try/catch` already returns 0 on any I/O error. One syscall per poll instead of two; eliminates a TOCTOU window.
+
+Tests: **73/73 unit pass** across 8 files (was 70/7). New: `core/interval.test.ts`.
+
 ## 2026-04-14 — Bound harness.log, `make logs`, and refactor `invokeWithHandle`
 Three improvements I'd been deferring:
 
