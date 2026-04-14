@@ -2,6 +2,20 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-04-14 — memfs 0.12.4: latent FUSE flush() correctness bug + test isolation
+A `/simplify` review pass on memfs 0.12.2 surfaced (and the follow-up tests caught) two real bugs upstream that shipped as `Haakam21/mem-fs` v0.12.3 + v0.12.4:
+
+- **v0.12.3** ([`2f5a851`](https://github.com/Haakam21/mem-fs/commit/2f5a851)) — cleanup pass: extracted `fuse::lazy_unmount()` (was duplicated and drifting between `stop_mount` and `fuse::mount`'s pre-clean), `DEFAULT_FACETS` constant, fixed `init` swallowing `db::migrate` errors with `let _ = ...`, fixed macOS `is_fuse_mounted` false-matching `/mnt` against `/mnt-old`, replaced bash test `sleep 2` magic numbers with a poll loop. New shared `tests/lib/fuse_mount.sh` helper used by all three test scripts.
+
+- **v0.12.4** ([`c9324d3`](https://github.com/Haakam21/mem-fs/commit/c9324d3)) — three "pre-existing" test_integration.sh failures turned out to be three real bugs:
+  1. Test 14 case-drift in expected error string (one-line fix).
+  2. The standalone `search` binary hardcoded `$HOME/.memfs` and ignored `MEMFS_DB`, so every invocation was reading from the developer's *real* memfs db regardless of test isolation. Rewrote as `find_db_path()` that resolves `MEMFS_DB` env → walk up from cwd → `$HOME/.memfs/db`, matching the memfs CLI.
+  3. **Latent FUSE correctness bug**: FUSE `release()` is async — the kernel does NOT wait for the daemon's release-reply before returning from `close()`. So `echo > file && stop_fuse_mount` could kill the daemon mid-flush and lose the buffered content. Memory was tagged correctly (because `create()` had run) but content was empty. Implemented `flush()` (which the kernel DOES wait for on close) that persists the buffer synchronously; `release()` stays as cleanup with a defensive late-write check.
+
+  The flush bug bites *anyone* using the pattern "write a file → kill the daemon → read the db", not just our tests. The new `tests/test_fuse_write.sh` is what surfaced it. Test results upstream went 34/37 → 37/37 + 7/7 + 3/3.
+
+After upgrading: same Mega-side workflow — `./memories/topics/foo.md` writes are correctly indexed, tagged, and synced. `make setup-memfs` will pick up 0.12.4 on next run; this clone's `~/.memfs/memfs` is already on 0.12.4.
+
 ## 2026-04-14 — Tests + docs for the runaway-process fix set
 - `core/invoke.ts`: env vars (`MEGA_CLAUDE_BIN`, `MEGA_INVOKE_TIMEOUT_MS`) are now read lazily inside `runClaude` so tests can override them between calls.
 - `core/invoke.test.ts`: 4 new integration tests that drive `invokeWithHandle` end-to-end with mock binaries:
