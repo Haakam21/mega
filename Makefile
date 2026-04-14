@@ -148,7 +148,7 @@ test: test-unit test-e2e
 
 # Unit tests only
 test-unit:
-	@bun test core/env.test.ts core/invoke.test.ts core/log-rotator.test.ts core/watchdog.test.ts core/websocket.test.ts slack/channel.test.ts agentmail/channel.test.ts
+	@bun test core/env.test.ts core/interval.test.ts core/invoke.test.ts core/log-rotator.test.ts core/watchdog.test.ts core/websocket.test.ts slack/channel.test.ts agentmail/channel.test.ts
 
 # E2E tests (requires harness running + .env configured)
 test-e2e:

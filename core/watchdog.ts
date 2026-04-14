@@ -1,5 +1,6 @@
 import { spawnSync } from "child_process";
 import { parsePositiveInt, parseNonNegativeInt, parseString } from "./env";
+import { startInterval, type IntervalHandle } from "./interval";
 
 // Periodic process-count watchdog. Belt-and-suspenders for the runaway-process
 // fix set: if every other defense layer (per-invocation timeout, tree-kill,
@@ -65,28 +66,16 @@ export function watchdogTick(): number {
   return evaluateWatchdog(countMatchingProcesses(), threshold(), pattern());
 }
 
-export interface WatchdogHandle {
-  stop: () => void;
-}
-
 /**
  * Start the watchdog interval. Returns a handle whose `stop()` clears the
  * timer — useful for tests and for a graceful shutdown path.
  */
-export function startWatchdog(): WatchdogHandle {
+export function startWatchdog(): IntervalHandle {
   const ms = intervalMs();
   const t = threshold();
   const p = pattern();
   console.log(
     `[watchdog] started (interval=${ms}ms threshold=${t} pattern=${JSON.stringify(p)})`
   );
-  // Run once immediately so an already-leaked state surfaces fast on startup.
-  watchdogTick();
-  const timer = setInterval(watchdogTick, ms);
-  // Don't keep the event loop alive just for the watchdog — if the harness
-  // is otherwise idle and exiting, the watchdog shouldn't block exit.
-  if (typeof timer.unref === "function") timer.unref();
-  return {
-    stop: () => clearInterval(timer),
-  };
+  return startInterval(watchdogTick, ms);
 }

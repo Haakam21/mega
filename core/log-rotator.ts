@@ -1,6 +1,7 @@
-import { statSync, writeFileSync, existsSync } from "fs";
+import { statSync, writeFileSync } from "fs";
 import { join } from "path";
 import { parsePositiveInt, parseString } from "./env";
+import { startInterval, type IntervalHandle } from "./interval";
 
 // Periodic harness.log rotator. The harness writes to harness.log via the
 // shell redirect set up by `make start`. `make start` uses `>>` (O_APPEND)
@@ -25,19 +26,18 @@ const intervalMs = () =>
   parsePositiveInt("MEGA_LOG_ROTATE_INTERVAL_MS", DEFAULT_INTERVAL_MS);
 
 /**
- * If the log file at `path` exceeds `maxBytes`, truncate it in place and
- * return the byte count that was just dropped. Returns 0 if no rotation
- * happened (file missing, under threshold, or stat failed). Best-effort —
- * any I/O error swallows to 0 so a transient EAGAIN doesn't crash the
- * harness.
+ * Pure rotation step: if the log file at `path` exceeds `cap` bytes,
+ * truncate it in place and return the byte count that was just dropped.
+ * Returns 0 if no rotation happened (file missing, under cap, or stat /
+ * write failed). Best-effort — any I/O error swallows to 0 so a transient
+ * EAGAIN doesn't crash the harness.
+ *
+ * No env reads. The caller supplies the path and cap so tests can drive
+ * this deterministically without setting env vars.
  */
-export function rotateLogIfNeeded(
-  path: string = logPath(),
-  cap: number = maxBytes()
-): number {
+export function rotateLogIfNeeded(path: string, cap: number): number {
   let size: number;
   try {
-    if (!existsSync(path)) return 0;
     size = statSync(path).size;
   } catch {
     return 0;
@@ -57,29 +57,26 @@ export function rotateLogIfNeeded(
   return size;
 }
 
-export interface LogRotatorHandle {
-  stop: () => void;
+/**
+ * Production tick: read env, call `rotateLogIfNeeded`. The split between
+ * this and `rotateLogIfNeeded` keeps the test suite free of env coupling
+ * while still exercising the rotation logic — same shape as
+ * `core/watchdog.ts` `evaluateWatchdog` + `watchdogTick`.
+ */
+export function logRotatorTick(): number {
+  return rotateLogIfNeeded(logPath(), maxBytes());
 }
 
 /**
  * Start the log-rotator interval. Returns a handle whose `stop()` clears
  * the timer.
  */
-export function startLogRotator(): LogRotatorHandle {
+export function startLogRotator(): IntervalHandle {
   const path = logPath();
   const cap = maxBytes();
   const ms = intervalMs();
   console.log(
     `[log-rotator] started (path=${path} max_bytes=${cap} interval=${ms}ms)`
   );
-  // Initial check so a stale-large file from a previous run gets rotated
-  // right away on startup, not after the first interval.
-  rotateLogIfNeeded(path, cap);
-  const timer = setInterval(() => {
-    rotateLogIfNeeded(path, cap);
-  }, ms);
-  if (typeof timer.unref === "function") timer.unref();
-  return {
-    stop: () => clearInterval(timer),
-  };
+  return startInterval(logRotatorTick, ms);
 }
