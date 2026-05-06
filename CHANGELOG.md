@@ -2,6 +2,17 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-04-21 — Linear webhook channel for hygiene audits
+
+New channel: `linear/channel.ts`. Receives Linear webhook POSTs via a Bun HTTP server, verifies HMAC-SHA256 signatures, filters for issues/projects moving to In Progress or In Review, then invokes Claude to audit against the team's hygiene rules. Violations are reported to Haakam on Slack for approval before any action is taken.
+
+- `linear/channel.ts` — HTTP server + webhook handler + event filtering
+- `index.ts` — starts linear channel when `LINEAR_WEBHOOK_SECRET` is set
+- `.env.example` — added `LINEAR_WEBHOOK_SECRET` and `MEGA_LINEAR_PORT`
+- `CLAUDE.md` — added Linear channel docs, project structure, env var table
+- `memories/projects/linear.md` — workspace context (teams, people, statuses, hygiene rules)
+- `memories/people/slack_ids.md` — team Slack user IDs for DM notifications
+
 ## 2026-04-14 — `/simplify` pass on log-rotator + `InvocationContext`
 A code review pass on commit `05822f8` surfaced one regression and a handful of cleanups.
 

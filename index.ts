@@ -1,5 +1,6 @@
 import { start as startAgentMail } from "./agentmail/channel";
 import { start as startSlack } from "./slack/channel";
+import { start as startLinear } from "./linear/channel";
 import { startWatchdog } from "./core/watchdog";
 import { startLogRotator } from "./core/log-rotator";
 
@@ -15,6 +16,11 @@ if (process.env.AGENTMAIL_API_KEY && process.env.AGENTMAIL_INBOX_ID) {
 if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN) {
   startSlack();
   channels.push("slack");
+}
+
+if (process.env.LINEAR_WEBHOOK_SECRET) {
+  startLinear();
+  channels.push("linear");
 }
 
 if (channels.length === 0) {

@@ -39,6 +39,7 @@ This repo is a portable agent image. Clone it, run `make setup`, get a running d
 - **Channels** are independently optional; at least one must be configured in `.env`. Each runs only if its env vars are set.
     - **AgentMail** (`AGENTMAIL_API_KEY`, `AGENTMAIL_INBOX_ID`) — pushes email events in real-time via WebSocket
     - **Slack** (`SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`) — pushes DM/mention events in real-time via Socket Mode
+    - **Linear** (`LINEAR_WEBHOOK_SECRET`) — receives Linear webhook POSTs via HTTP server, runs hygiene audits on issues/projects
 - **GitHub CLI (`gh`)** enables code review on GitHub PRs
 - **Bun** is the runtime — TypeScript, WebSocket, fetch, and subprocess all built-in
 - **No runtime dependencies beyond bun, jq, gh, and claude**
@@ -64,6 +65,8 @@ mega/
 │   ├── channel.ts     # Slack Socket Mode WebSocket + event handling + reply
 │   ├── channel.test.ts # Unit tests for buildPrompt
 │   └── manifest.json  # Slack app manifest — paste into api.slack.com
+├── linear/
+│   └── channel.ts     # Linear webhook HTTP server + hygiene audit
 ├── test/
 │   ├── mock-claude.sh  # Mock claude CLI for unit tests
 │   ├── slow-claude.sh  # Slow mock for kill/interrupt tests
@@ -122,6 +125,8 @@ Testing hooks: `MEGA_CLAUDE_BIN` swaps the binary (defaults to `claude`), used b
 | `MEGA_LOG_PATH` | `<repo>/harness.log` | log file path (test override) |
 | `MEGA_CLAUDE_BIN` | `claude` | path to the Claude binary (test override) |
 | `MEGA_SEEN_EVENTS_PATH` | `<repo>/.seen_events` | dedup file path (test override) |
+| `LINEAR_WEBHOOK_SECRET` | (none) | HMAC-SHA256 signing secret for Linear webhooks |
+| `MEGA_LINEAR_PORT` | `8000` | HTTP server port for Linear webhook receiver |
 
 All env vars are parsed via `core/env.ts` (`parsePositiveInt` / `parseNonNegativeInt` / `parseString`) — `0` for a positive-int knob is rejected and falls back to the default rather than silently passing through.
 
@@ -147,6 +152,17 @@ All env vars are parsed via `core/env.ts` (`parsePositiveInt` / `parseNonNegativ
 10. Thread context recovery: every invocation fetches thread history via `conversations.replies` and prepends it to the prompt, so even fresh sessions have full context (fixes proactive message session mismatch)
 11. Mega can proactively DM users via `conversations.open` + `chat.postMessage` (requires `im:write` scope)
     - Haakam's Slack user ID: `U08TMCS2KRT`, DM channel: `D0AS9T5CP4K`
+
+### How Linear Webhooks Work
+1. Operator creates a webhook in Linear (Settings → API → Webhooks) pointing to the server's `/linear/webhook` endpoint
+2. `linear/channel.ts` starts a Bun HTTP server on `MEGA_LINEAR_PORT` (default 8000)
+3. Linear sends signed POST requests when issues/projects change
+4. The channel verifies the HMAC-SHA256 signature using `LINEAR_WEBHOOK_SECRET`
+5. Only relevant events are processed: issues moving to In Progress / In Review, or projects moving to In Progress
+6. Claude is invoked via `core/invoke.ts` to analyze the item against hygiene rules
+7. If violations are found, Claude notifies Haakam on Slack (DM) with findings and proposed actions
+8. Claude does NOT take action on issues directly — Haakam approves via Slack first
+9. The operator is responsible for exposing the port to the internet (reverse proxy, tunnel, etc.)
 
 ### Testing
 - `make test` — run all tests (unit + E2E)
