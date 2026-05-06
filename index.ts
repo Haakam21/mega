@@ -3,24 +3,55 @@ import { start as startSlack } from "./slack/channel";
 import { start as startLinear } from "./linear/channel";
 import { startWatchdog } from "./core/watchdog";
 import { startLogRotator } from "./core/log-rotator";
+import { SpoolClient } from "./core/spool";
+import { startAgentMailConsumer } from "./core/spool-loop";
+import {
+  inboxThread as agentmailInboxThread,
+  startInbound as startAgentMailInbound,
+  startOutbound as startAgentMailOutbound,
+} from "./agentmail/spool-relay";
 
 console.log("Mega agent harness starting...");
 
 const channels: string[] = [];
 
-if (process.env.AGENTMAIL_API_KEY && process.env.AGENTMAIL_INBOX_ID) {
-  startAgentMail();
-  channels.push("agentmail");
-}
+const useSpool = process.env.MEGA_USE_SPOOL === "true";
+const domain = process.env.MEGA_DOMAIN ?? "india-desert.exe.xyz";
+const spoolUrl = process.env.MEGA_SPOOL_URL ?? "https://spool.computer";
 
-if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN) {
-  startSlack();
-  channels.push("slack");
-}
+if (useSpool) {
+  // Spool is the I/O substrate: each third-party channel runs as a
+  // bidirectional relay (events ↔ Spool thread); Mega's consumer loop
+  // tails cursors and invokes Claude. Direct channels stay disabled
+  // when MEGA_USE_SPOOL=true to avoid double-processing.
+  const spool = new SpoolClient(spoolUrl, `mega@${domain}`);
+  console.log(`[mega] spool=${spoolUrl} as mega@${domain}`);
 
-if (process.env.LINEAR_WEBHOOK_SECRET) {
-  startLinear();
-  channels.push("linear");
+  if (process.env.AGENTMAIL_API_KEY && process.env.AGENTMAIL_INBOX_ID) {
+    startAgentMailInbound(spool);
+    void startAgentMailOutbound(spool);
+    void startAgentMailConsumer(
+      spool,
+      agentmailInboxThread(),
+      "mega-agentmail"
+    );
+    channels.push("agentmail-spool");
+  }
+} else {
+  if (process.env.AGENTMAIL_API_KEY && process.env.AGENTMAIL_INBOX_ID) {
+    startAgentMail();
+    channels.push("agentmail");
+  }
+
+  if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN) {
+    startSlack();
+    channels.push("slack");
+  }
+
+  if (process.env.LINEAR_WEBHOOK_SECRET) {
+    startLinear();
+    channels.push("linear");
+  }
 }
 
 if (channels.length === 0) {
