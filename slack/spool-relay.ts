@@ -85,9 +85,12 @@ export async function startInbound(spool: SpoolClient): Promise<void> {
       }
       if (data.type !== "events_api") return;
       const evt = data.payload?.event;
-      if (!evt || evt.type !== "message") return;
-      // Drop bot messages (including our own) and message subtypes that
-      // aren't user-authored content.
+      if (!evt) return;
+      // Two event shapes drive the bot: `message` covers DMs (since the
+      // manifest subscribes to `message.im`); `app_mention` covers
+      // @mentions in any channel the bot can see. Both arrive with the
+      // same `text`/`channel`/`ts`/`thread_ts`/`user` fields we need.
+      if (evt.type !== "message" && evt.type !== "app_mention") return;
       if (evt.bot_id || evt.user === myId) return;
       if (evt.subtype && evt.subtype !== "file_share") return;
 

@@ -2,6 +2,7 @@
 *.pid
 *.log
 .seen_events
+.invoked_sessions
 .slack-images/
 sessions
 memories
