@@ -4,12 +4,17 @@ import { start as startLinear } from "./linear/channel";
 import { startWatchdog } from "./core/watchdog";
 import { startLogRotator } from "./core/log-rotator";
 import { SpoolClient } from "./core/spool";
-import { startAgentMailConsumer } from "./core/spool-loop";
+import { startAgentMailConsumer, startSlackConsumer } from "./core/spool-loop";
 import {
   inboxThread as agentmailInboxThread,
   startInbound as startAgentMailInbound,
   startOutbound as startAgentMailOutbound,
 } from "./agentmail/spool-relay";
+import {
+  slackThread as slackSpoolThread,
+  startInbound as startSlackInbound,
+  startOutbound as startSlackOutbound,
+} from "./slack/spool-relay";
 
 console.log("Mega agent harness starting...");
 
@@ -36,6 +41,16 @@ if (useSpool) {
       "mega-agentmail"
     );
     channels.push("agentmail-spool");
+  }
+
+  if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN) {
+    void (async () => {
+      const thread = await slackSpoolThread();
+      await startSlackInbound(spool);
+      await startSlackOutbound(spool);
+      await startSlackConsumer(spool, thread, "mega-slack");
+    })();
+    channels.push("slack-spool");
   }
 } else {
   if (process.env.AGENTMAIL_API_KEY && process.env.AGENTMAIL_INBOX_ID) {
