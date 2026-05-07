@@ -27,6 +27,13 @@ const maxSeenEvents = () =>
 const seenFilePath = () =>
   parseString("MEGA_SEEN_EVENTS_PATH", join(ROOT, ".seen_events"));
 
+// Tracks Claude session UUIDs we've successfully invoked at least once. On
+// the next call with the same UUID we use `--resume`; on a fresh UUID we
+// skip straight to `--session-id`. Without this we always tried `--resume`
+// first, wasting ~5–7 s per fresh session before the fallback kicked in.
+const invokedSessionsPath = () =>
+  parseString("MEGA_INVOKED_SESSIONS_PATH", join(ROOT, ".invoked_sessions"));
+
 // Resolve the memories symlink to the real path (FUSE mount)
 // Claude's tools don't follow symlinks into FUSE mounts, so we need --add-dir
 const MEMORIES_REAL_PATH = existsSync(MEMORIES_SYMLINK)
@@ -151,6 +158,34 @@ function isDuplicate(eventId: string): boolean {
   return false;
 }
 
+const initialInvokedSessions = (() => {
+  const path = invokedSessionsPath();
+  if (!existsSync(path)) return [];
+  return readFileSync(path, "utf-8").split("\n").filter(Boolean);
+})();
+
+const invokedSessions = new BoundedFifoSet(
+  initialInvokedSessions,
+  maxSeenEvents()
+);
+
+function isKnownSession(uuid: string): boolean {
+  return invokedSessions.has(uuid);
+}
+
+function markSessionInvoked(uuid: string): void {
+  const { added, evicted } = invokedSessions.add(uuid, maxSeenEvents());
+  if (!added) return;
+  if (evicted.length > 0) {
+    writeFileSync(
+      invokedSessionsPath(),
+      invokedSessions.toArray().join("\n") + "\n"
+    );
+  } else {
+    appendFile(invokedSessionsPath(), uuid + "\n", () => {});
+  }
+}
+
 // Test seams: not part of the public surface. Tests call these to reset and
 // inspect the dedup state without going through the public invoke path.
 export function __resetSeenEventsForTests(): void {
@@ -220,9 +255,9 @@ class InvocationContext {
   }
 
   /**
-   * The full invocation flow: dedup → try `--resume` → fall back to
-   * `--session-id`. Bails immediately if the context is killed at any
-   * suspension point.
+   * The full invocation flow: dedup → pick `--resume` (known session)
+   * or `--session-id` (fresh) → fall back the other way on failure.
+   * Bails immediately if the context is killed at any suspension point.
    */
   async run(): Promise<string | null> {
     const { eventId, sessionId } = this.options;
@@ -232,17 +267,23 @@ class InvocationContext {
     }
 
     const uuid = toUUID(sessionId);
+    const known = isKnownSession(uuid);
+    const primary = known ? "--resume" : "--session-id";
+    const fallback = known ? "--session-id" : "--resume";
 
-    let response = await this.runClaude(["--resume", uuid]);
+    let response = await this.runClaude([primary, uuid]);
     if (this.killed) return null;
 
     if (!response) {
-      console.log(`[invoke] resume failed session=${this.sessionTag} — retrying with --session-id`);
-      response = await this.runClaude(["--session-id", uuid]);
+      console.log(
+        `[invoke] ${primary} failed session=${this.sessionTag} — retrying with ${fallback}`
+      );
+      response = await this.runClaude([fallback, uuid]);
       if (this.killed) return null;
     }
 
     if (response) {
+      markSessionInvoked(uuid);
       console.log(`[invoke] response session=${this.sessionTag} chars=${response.length}`);
     } else {
       console.log(`[invoke] no response session=${this.sessionTag}`);
