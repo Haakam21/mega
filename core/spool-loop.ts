@@ -12,7 +12,7 @@
  */
 
 import { invokeWithHandle } from "./invoke";
-import { fetchThreadHistory } from "../slack/spool-relay";
+import { fetchThreadHistory, startForkOutbound } from "../slack/spool-relay";
 import type { SpoolClient, SpoolEvent } from "./spool";
 
 const AGENTMAIL_SYSTEM_PROMPT =
@@ -120,34 +120,88 @@ Inbox ID: ${d.inbox_id}
 ${d.text || "(no text content)"}`;
 }
 
-/** Slack consumer. Tails ns=slack/type=message events, fetches thread
- *  history for context, invokes Claude with sessionId=slack-channel-threadTs,
- *  publishes message.end so the slack-spool outbound relay can post the
- *  reply. */
-export async function startSlackConsumer(
+/** Slack v2 consumer. Tails a discovery cursor on the bot's root thread
+ *  filtered to `thread.forked` events; spawns a per-fork inbound consumer
+ *  + outbound relay each time a new fork is announced. Each per-fork
+ *  inbound consumer reads `ns=slack, type=message` events in `Lineage`
+ *  mode (transparently walking the parent if it ever got events before
+ *  the fork existed), invokes Claude with sessionId = fork name, and
+ *  publishes `message.end` back to the same fork — the outbound consumer
+ *  picks that up and posts to Slack.
+ *
+ *  Idempotent on restart: the discovery cursor's persisted position
+ *  replays missed forks; the in-memory `active` set keeps a re-announce
+ *  during backfill from double-spawning. */
+export async function startSlackV2(
   spool: SpoolClient,
-  thread: string,
-  cursorName: string
+  parent: string
 ): Promise<void> {
-  await spool.createThread(thread);
-  const cursor = await spool.createCursor(thread, {
-    name: cursorName,
-    filter_ns: "slack",
-    filter_type: "message",
+  await spool.createThread(parent);
+  const discovery = await spool.createCursor(parent, {
+    name: "mega-slack-discovery",
+    filter_ns: "thread",
+    filter_type: "forked",
   });
   console.log(
-    `[spool-loop] slack consumer: cursor=${cursor.id} on ${thread} from seq=${cursor.cursor_seq}`
+    `[spool-loop] slack v2 discovery: cursor=${discovery.id} on ${parent} from seq=${discovery.cursor_seq}`
   );
+
+  const active = new Set<string>();
 
   (async () => {
     try {
+      for await (const ev of spool.tailCursor(discovery.id)) {
+        const child = ev.data?.child as string | undefined;
+        if (!child) {
+          console.warn(
+            `[spool-loop] slack v2 discovery: malformed thread.forked event seq=${ev.seq}`
+          );
+          await spool.ackCursor(discovery.id, ev.seq + 1);
+          continue;
+        }
+        if (!active.has(child)) {
+          active.add(child);
+          spawnSlackForkConsumer(spool, child);
+          void startForkOutbound(spool, child).catch((e) => {
+            console.error(
+              `[spool-loop] slack v2 outbound spawn (${child}) failed:`,
+              e
+            );
+          });
+          console.log(
+            `[spool-loop] slack v2: spawned consumer + outbound for ${child}`
+          );
+        }
+        await spool.ackCursor(discovery.id, ev.seq + 1);
+      }
+    } catch (e) {
+      console.error("[spool-loop] slack v2 discovery tail failed:", e);
+    }
+  })();
+}
+
+function spawnSlackForkConsumer(spool: SpoolClient, fork: string): void {
+  (async () => {
+    try {
+      const cursor = await spool.createCursor(fork, {
+        name: "mega-slack-inbound",
+        filter_ns: "slack",
+        filter_type: "message",
+        seq_mode: "lineage",
+      });
+      console.log(
+        `[spool-loop] slack v2 inbound: cursor=${cursor.id} on ${fork} from seq=${cursor.cursor_seq}`
+      );
       for await (const ev of spool.tailCursor(cursor.id)) {
         const wakeAt = Date.now();
-        await handleSlackInbound(spool, thread, ev, wakeAt);
+        await handleSlackInbound(spool, fork, ev, wakeAt);
         await spool.ackCursor(cursor.id, ev.seq + 1);
       }
     } catch (e) {
-      console.error("[spool-loop] slack consumer tail failed:", e);
+      console.error(
+        `[spool-loop] slack v2 inbound tail (${fork}) failed:`,
+        e
+      );
     }
   })();
 }

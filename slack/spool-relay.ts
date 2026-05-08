@@ -1,15 +1,17 @@
 /**
  * Slack ↔ Spool relay. Bidirectional bridge:
- *   inbound  : Slack Socket Mode WebSocket → Spool publish (ns=slack, type=message)
- *   outbound : Spool cursor tail (ns=message, type=end) → Slack chat.postMessage
+ *   inbound  : Slack Socket Mode WebSocket → fork `slack/<bot>` per Slack
+ *              thread, then publish `ns=slack, type=message` into the fork.
+ *   outbound : Spool cursor tail per fork (ns=message, type=end) →
+ *              Slack chat.postMessage. Per-fork outbound consumers are
+ *              spawned by the discovery loop in `core/spool-loop.ts`.
  *
- * Same shape as agentmail/spool-relay.ts. The Mega consumer
- * (core/spool-loop.ts::startSlackConsumer) sits between, fetching
- * thread history, invoking Claude, and publishing the response.
- *
- * Thread topology: one Spool thread per bot user — `slack/<bot_user_id>`.
- * Channel + thread_ts ride in event data; per-Slack-thread isolation is
- * the consumer's responsibility (via Claude session_id).
+ * Thread topology (v2): root `slack/<bot_user_id>` only carries
+ * `thread.forked` audit events. Each Slack thread gets its own fork
+ * `slack/<bot>/<channel>/<thread_ts>` carrying that conversation's
+ * inbound + outbound events. The consumer (`startSlackV2` in spool-loop)
+ * tails a discovery cursor on the root and spawns per-fork consumers as
+ * forks appear.
  */
 
 import { connectWebSocket } from "../core/websocket";
@@ -46,11 +48,23 @@ async function slackAPI(method: string, body: any): Promise<any> {
   return await res.json();
 }
 
-/** The Spool thread this bot publishes to and tails. Computed from the
- *  bot user id resolved at startup. */
+/** The bot's root Spool thread — `slack/<bot_user_id>`. Resolved from
+ *  Slack's `auth.test` at startup. Forks descend from this. */
 export async function slackThread(): Promise<string> {
   const id = await getBotUserId();
   return `slack/${id}`;
+}
+
+/** Fork name for a single Slack thread under the bot's root. Stable per
+ *  `(channel, thread_ts)` so two events on the same Slack thread land on
+ *  the same fork. Exported so the discovery loop can recompute it for
+ *  cross-checks. */
+export function slackForkName(
+  parent: string,
+  channel: string,
+  threadTs: string
+): string {
+  return `${parent}/${channel}/${threadTs}`;
 }
 
 export async function startInbound(spool: SpoolClient): Promise<void> {
@@ -101,7 +115,7 @@ export async function startInbound(spool: SpoolClient): Promise<void> {
 
 async function publishInbound(
   spool: SpoolClient,
-  thread: string,
+  parent: string,
   evt: any,
   envelopeId: string | undefined,
   myId: string
@@ -109,6 +123,7 @@ async function publishInbound(
   const channel = evt.channel;
   const ts = evt.ts;
   const threadTs = evt.thread_ts || evt.ts;
+  const fork = slackForkName(parent, channel, threadTs);
 
   // 🤔 reaction signals "Mega is thinking"; outbound clears it on reply.
   // Best-effort — don't block the publish on this.
@@ -121,7 +136,16 @@ async function publishInbound(
   });
 
   try {
-    await spool.publish(thread, [
+    // Idempotent: existing forks are 409'd and treated as success by the
+    // client. Server resolves seq_offset to the parent's current tail.
+    await spool.createThread(fork, parent);
+  } catch (e) {
+    console.error("[slack-spool] inbound forkThread failed:", e);
+    return;
+  }
+
+  try {
+    await spool.publish(fork, [
       {
         ns: "slack",
         type: "message",
@@ -144,16 +168,21 @@ async function publishInbound(
   }
 }
 
-export async function startOutbound(spool: SpoolClient): Promise<void> {
-  const thread = await slackThread();
-  await spool.createThread(thread);
-  const cursor = await spool.createCursor(thread, {
+/** Spawn an outbound consumer on a single fork. The discovery loop in
+ *  `core/spool-loop.ts::startSlackV2` calls this once per fork as
+ *  `thread.forked` events arrive. Idempotent on `(client_id, fork)` —
+ *  a re-spawn on harness restart resumes from the persisted position. */
+export async function startForkOutbound(
+  spool: SpoolClient,
+  fork: string
+): Promise<void> {
+  const cursor = await spool.createCursor(fork, {
     name: "slack-outbound",
     filter_ns: "message",
     filter_type: "end",
   });
   console.log(
-    `[slack-spool] outbound: cursor=${cursor.id} from seq=${cursor.cursor_seq}`
+    `[slack-spool] outbound: cursor=${cursor.id} on ${fork} from seq=${cursor.cursor_seq}`
   );
 
   (async () => {
@@ -163,7 +192,7 @@ export async function startOutbound(spool: SpoolClient): Promise<void> {
         await spool.ackCursor(cursor.id, ev.seq + 1);
       }
     } catch (e) {
-      console.error("[slack-spool] outbound tail failed:", e);
+      console.error(`[slack-spool] outbound tail (${fork}) failed:`, e);
     }
   })();
 }

@@ -96,7 +96,10 @@ setup-github:
 # subsequent writes create a sparse file with the offset as a hole.
 start: stop
 	@echo "Starting agent harness..."
-	@setsid bash -c 'echo $$$$ > harness.pid; exec bun run index.ts' \
+	@# bun is installed under $$HOME/.bun/bin by its install script and is
+	@# not on the default PATH, so prepend it here. Otherwise restarts from
+	@# a non-login shell silently exit with "exec: bun: not found".
+	@setsid bash -c 'export PATH="$$HOME/.bun/bin:$$PATH"; echo $$$$ > harness.pid; exec bun run index.ts' \
 		>> harness.log 2>&1 < /dev/null &
 	@sleep 0.2
 	@echo "Agent harness started (PGID $$(cat harness.pid))"
@@ -148,7 +151,7 @@ test: test-unit test-e2e
 
 # Unit tests only
 test-unit:
-	@bun test core/env.test.ts core/interval.test.ts core/invoke.test.ts core/log-rotator.test.ts core/watchdog.test.ts core/websocket.test.ts slack/channel.test.ts agentmail/channel.test.ts
+	@bun test core/env.test.ts core/interval.test.ts core/invoke.test.ts core/log-rotator.test.ts core/watchdog.test.ts core/websocket.test.ts slack/channel.test.ts slack/spool-relay.test.ts agentmail/channel.test.ts
 
 # E2E tests (requires harness running + .env configured)
 test-e2e:
