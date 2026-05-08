@@ -97,6 +97,17 @@ export class SpoolClient {
     if (!res.ok) throw await spoolError(res);
   }
 
+  /** True if the thread exists and the caller can read it. False on 404.
+   *  Other errors propagate — a transient 5xx shouldn't be misread as
+   *  "thread missing" by callers using this as a gate. */
+  async threadExists(name: string): Promise<boolean> {
+    const path = `/threads/${encodeURIComponent(name)}`;
+    const res = await this.req("GET", path, {});
+    if (res.ok) return true;
+    if (res.status === 404) return false;
+    throw await spoolError(res);
+  }
+
   async publish(thread: string, events: EventInput[]): Promise<{ start_seq: number; end_seq: number }> {
     const path = `/threads/${encodeURIComponent(thread)}/events`;
     const res = await this.req("POST", path, {

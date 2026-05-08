@@ -100,15 +100,29 @@ export async function startInbound(spool: SpoolClient): Promise<void> {
       if (data.type !== "events_api") return;
       const evt = data.payload?.event;
       if (!evt) return;
-      // Two event shapes drive the bot: `message` covers DMs (since the
-      // manifest subscribes to `message.im`); `app_mention` covers
-      // @mentions in any channel the bot can see. Both arrive with the
-      // same `text`/`channel`/`ts`/`thread_ts`/`user` fields we need.
       if (evt.type !== "message" && evt.type !== "app_mention") return;
       if (evt.bot_id || evt.user === myId) return;
       if (evt.subtype && evt.subtype !== "file_share") return;
 
-      void publishInbound(spool, thread, evt, data.envelope_id, myId);
+      // Three intake shapes:
+      //  - `app_mention`: always processed (the user has opted in).
+      //  - `message` in a DM (`channel_type === "im"`): always processed
+      //    (we subscribe to `message.im` and DMs are inherently 1:1).
+      //  - `message` in a channel: only processed if Mega is already
+      //    participating in this Slack thread, i.e. a fork exists. This
+      //    keeps the bot from responding to unrelated channel chatter
+      //    just because it's a member of the channel.
+      const isOptIn =
+        evt.type === "app_mention" || evt.channel_type === "im";
+
+      void publishInbound(
+        spool,
+        thread,
+        evt,
+        data.envelope_id,
+        myId,
+        isOptIn
+      );
     },
   });
 }
@@ -118,12 +132,31 @@ async function publishInbound(
   parent: string,
   evt: any,
   envelopeId: string | undefined,
-  myId: string
+  myId: string,
+  isOptIn: boolean
 ): Promise<void> {
   const channel = evt.channel;
   const ts = evt.ts;
   const threadTs = evt.thread_ts || evt.ts;
   const fork = slackForkName(parent, channel, threadTs);
+
+  // For non-opt-in events (channel messages without an @mention), only
+  // proceed if Mega is already participating in this Slack thread —
+  // i.e. a fork already exists. Stateless across restarts (just a Spool
+  // GET) so we don't need an in-memory active-thread set.
+  if (!isOptIn) {
+    let exists = false;
+    try {
+      exists = await spool.threadExists(fork);
+    } catch (e) {
+      console.warn(
+        `[slack-spool] inbound threadExists(${fork}) failed:`,
+        e
+      );
+      return;
+    }
+    if (!exists) return;
+  }
 
   // 🤔 reaction signals "Mega is thinking"; outbound clears it on reply.
   // Best-effort — don't block the publish on this.
@@ -149,7 +182,12 @@ async function publishInbound(
       {
         ns: "slack",
         type: "message",
-        id: envelopeId,
+        // `channel:ts` is the stable identity of a Slack message. Slack
+        // delivers a single user @mention as TWO Socket Mode events
+        // (`app_mention` + `message.groups`/`message.channels`) with
+        // different `envelope_id`s; publishing both with envelope-derived
+        // ids would double-fire the consumer. Spool dedups on `id`.
+        id: `${channel}:${ts}`,
         source: `slack.relay@${process.env.MEGA_DOMAIN ?? "india-desert.exe.xyz"}`,
         data: {
           event_id: envelopeId,

@@ -22,6 +22,9 @@
         "assistant_thread_started",
         "assistant_thread_context_changed",
         "message.im",
+        "message.channels",
+        "message.groups",
+        "message.mpim",
         "app_mention"
       ]
     },
@@ -33,10 +36,13 @@
     "scopes": {
       "bot": [
         "assistant:write",
+        "channels:history",
         "chat:write",
         "files:read",
+        "groups:history",
         "im:history",
         "im:write",
+        "mpim:history",
         "reactions:write",
         "app_mentions:read",
         "users:read"
