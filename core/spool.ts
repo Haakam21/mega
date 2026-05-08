@@ -32,6 +32,22 @@ export interface EventInput {
   data: any;
 }
 
+/**
+ * Seq rendering preference for a cursor.
+ *
+ * - **lineage** (default): seqs are absolute (`s2_seq + thread.seq_offset`).
+ *   Reads on a fork walk parent threads when the cursor's stored position
+ *   is below the fork's `seq_offset`, then cross into the cursor's thread.
+ *   For a root thread this behaves identically to `local`.
+ * - **local**: seqs are S2-internal (always 0-based per thread). Reads
+ *   stay on the cursor's thread and never walk ancestors. Useful for an
+ *   isolated sub-agent that wants a fresh-thread mental model.
+ *
+ * Wire format is the lowercase string. The server stores `cursor_seq`
+ * canonical absolute regardless of mode and translates at read/ack.
+ */
+export type SeqMode = "lineage" | "local";
+
 export interface Cursor {
   id: string;
   client_id: string;
@@ -40,6 +56,10 @@ export interface Cursor {
   filter_ns: string | null;
   filter_type: string | null;
   cursor_seq: number;
+  seq_mode: SeqMode;
+  /** What the caller passed for `starting_seq` at create time, or
+   *  null/undefined if the cursor started at the implicit default 0. */
+  starting_seq?: number | null;
   created_at: string;
 }
 
@@ -52,6 +72,14 @@ export interface CreateCursorRequest {
   name: string;
   filter_ns?: string;
   filter_type?: string;
+  /** Defaults to `"lineage"` server-side. Once set, immutable for the
+   *  cursor's lifetime — create a new cursor to switch modes. */
+  seq_mode?: SeqMode;
+  /** Optional explicit starting position. `undefined` means start at 0
+   *  (the common case). Set to `n` to position a fresh cursor mid-thread.
+   *  Interpreted in `seq_mode` space — for `"lineage"` this is an absolute
+   *  seq, for `"local"` it is an S2-internal 0-based seq. */
+  starting_seq?: number;
 }
 
 export class SpoolClient {
