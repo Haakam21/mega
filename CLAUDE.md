@@ -40,6 +40,7 @@ This repo is a portable agent image. Clone it, run `make setup`, get a running d
     - **AgentMail** (`AGENTMAIL_API_KEY`, `AGENTMAIL_INBOX_ID`) — pushes email events in real-time via WebSocket
     - **Slack** (`SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`) — pushes DM/mention events in real-time via Socket Mode
     - **Linear** (`LINEAR_WEBHOOK_SECRET`) — receives Linear webhook POSTs via HTTP server, runs hygiene audits on issues/projects
+- **Spool** (`MEGA_USE_SPOOL=true`, `MEGA_SPOOL_URL`) — when enabled, all channels run as bidirectional relays into Spool (https://spool.computer). Mega's consumer loops in `core/spool-loop.ts` tail per-conversation cursors and invoke Claude. Slack uses a per-Slack-thread fork topology (root `slack/<bot>` + fork `slack/<bot>/<channel>/<ts>`); AgentMail uses a single thread per inbox.
 - **GitHub CLI (`gh`)** enables code review on GitHub PRs
 - **Bun** is the runtime — TypeScript, WebSocket, fetch, and subprocess all built-in
 - **No runtime dependencies beyond bun, jq, gh, and claude**
@@ -56,14 +57,19 @@ mega/
 │   ├── interval.ts    # startInterval(tick, ms) — shared by watchdog + log-rotator
 │   ├── invoke.ts      # Shared: dedup, invoke claude, return response
 │   ├── log-rotator.ts # Periodic harness.log size cap + truncate-in-place
+│   ├── spool.ts       # Spool TS client (used when MEGA_USE_SPOOL=true)
+│   ├── spool-loop.ts  # Spool consumers: AgentMail + Slack v2 (discovery + per-fork)
 │   ├── watchdog.ts    # Periodic claude-process count + warn (runaway leak guard)
 │   └── websocket.ts   # Shared: reconnecting WebSocket client
 ├── agentmail/
-│   ├── channel.ts     # AgentMail WebSocket + event handling + reply
+│   ├── channel.ts     # Direct AgentMail channel (used when MEGA_USE_SPOOL=false)
+│   ├── spool-relay.ts # AgentMail ↔ Spool relay (used when MEGA_USE_SPOOL=true)
 │   └── e2e.test.ts    # End-to-end test (send email, verify reply + session continuity)
 ├── slack/
-│   ├── channel.ts     # Slack Socket Mode WebSocket + event handling + reply
+│   ├── channel.ts     # Direct Slack channel (used when MEGA_USE_SPOOL=false)
 │   ├── channel.test.ts # Unit tests for buildPrompt
+│   ├── spool-relay.ts # Slack ↔ Spool v2 relay (used when MEGA_USE_SPOOL=true)
+│   ├── spool-relay.test.ts # Unit tests for slackForkName + intake helpers
 │   └── manifest.json  # Slack app manifest — paste into api.slack.com
 ├── linear/
 │   └── channel.ts     # Linear webhook HTTP server + hygiene audit
@@ -140,18 +146,35 @@ All env vars are parsed via `core/env.ts` (`parsePositiveInt` / `parseNonNegativ
 7. **Concurrency**: per-thread interrupt-and-merge mirrors Slack — a new email in an already-active thread kills the in-flight invocation and respawns with all messages merged into one prompt. Global cap of `MEGA_AGENTMAIL_MAX_CONCURRENT` (default 4) distinct active threads; excess threads queue up to `MEGA_AGENTMAIL_MAX_QUEUE` (default 100), then drop with a warning. The reply target is always the latest message in the thread.
 
 ### How Slack Works
-1. Create a Slack app at api.slack.com using `slack/manifest.json`
-2. Generate an App-Level Token with `connections:write` scope → `SLACK_APP_TOKEN`
-3. Install to workspace → `SLACK_BOT_TOKEN`
-4. `slack/channel.ts` connects via Socket Mode (WebSocket, no public URL needed)
-5. When a message arrives (DM or @mention), it invokes Claude via `core/invoke.ts`
-6. Claude's response is posted back via the Slack API (in-thread)
-7. Mega appears in Slack's **Agents** tab (via `assistant_view` feature in manifest)
-8. Messages can interrupt an in-progress invocation — Claude restarts with all messages combined
-9. 🤔 reaction on the latest message indicates thinking (doesn't block input like `setStatus`)
-10. Thread context recovery: every invocation fetches thread history via `conversations.replies` and prepends it to the prompt, so even fresh sessions have full context (fixes proactive message session mismatch)
-11. Mega can proactively DM users via `conversations.open` + `chat.postMessage` (requires `im:write` scope)
-    - Haakam's Slack user ID: `U08TMCS2KRT`, DM channel: `D0AS9T5CP4K`
+
+The Slack channel runs in two modes selected by `MEGA_USE_SPOOL`:
+
+- **`MEGA_USE_SPOOL=false`** (legacy): `slack/channel.ts` connects via Socket Mode and invokes Claude directly per event. One Claude session per Slack thread keyed `slack-${channel}-${thread_ts}`.
+- **`MEGA_USE_SPOOL=true`** (current): `slack/spool-relay.ts` is a Spool bridge — Slack events publish into a Spool fork per Slack thread, the Mega consumer (`core/spool-loop.ts::startSlackV2`) tails them and invokes Claude, and replies route back through the same fork to Slack.
+
+#### Setup (both modes)
+1. Create a Slack app at api.slack.com using `slack/manifest.json`. The manifest subscribes to `app_mention`, `message.im`, `message.channels`, `message.groups`, `message.mpim` and grants the matching `*:history` + `chat:write` + `reactions:write` scopes.
+2. Generate an App-Level Token with `connections:write` → `SLACK_APP_TOKEN`.
+3. Install to workspace → `SLACK_BOT_TOKEN`.
+4. Mega appears in Slack's **Agents** tab (via `assistant_view` feature in manifest). Mega can proactively DM users via `conversations.open` + `chat.postMessage` (uses `im:write` scope).
+   - Haakam's Slack user ID: `U08TMCS2KRT`, DM channel: `D0AS9T5CP4K`.
+
+#### Spool-relay (v2) topology
+- **Root thread** `slack/<bot_user_id>` carries only `thread.forked` audit events. No user messages live here.
+- **Per-Slack-thread fork** `slack/<bot>/<channel>/<thread_ts>` carries the full conversation: `ns=slack/type=message` (inbound) + `ns=message/type=end` (outbound).
+- **Discovery cursor** on the root, filtered to `ns=thread/type=forked`, drives `startSlackV2`. Every new fork triggers two per-fork tails: an inbound consumer (filter `slack/message`, `seq_mode: lineage`) and an outbound relay (filter `message/end`).
+- **Inbound intake** in `publishInbound`:
+  - `app_mention` and DM (`channel_type === "im"`) — opt-in, always fork-or-resume.
+  - Other channel `message` — only proceed if the fork already exists (`spool.threadExists`); keeps Mega from responding to unrelated channel chatter just because it's a member.
+- **Dedup**: Slack delivers a single user @mention as both `app_mention` and `message.{groups,channels}` with different `envelope_id`s. The spool publish uses `id: ${channel}:${ts}` so spool dedupes them server-side.
+- 🤔 reaction on the latest message indicates thinking; outbound clears it on reply.
+- Thread context recovery: every invocation fetches Slack thread history via `conversations.replies` and prepends it to the prompt, so a fresh Claude session still has full context.
+- Claude session id is `slack-${channel}-${thread_ts}` (same as v1) so session continuity holds across the v1↔v2 transition.
+
+#### Live test gotchas (recorded 2026-05-08)
+- `C…` channel ids cover both public AND private channels; `conversations.replies` returning `missing_scope: groups:history` is the giveaway. Hence `message.groups` + `groups:history` in the manifest.
+- `assistant_view` does not redirect channel events — `app_mention` + `message.*` still fire normally.
+- Slack manifest changes require **Reinstall App** before new event subscriptions take effect, but the existing bot token doesn't rotate.
 
 ### How Linear Webhooks Work
 1. Operator creates a webhook in Linear (Settings → API → Webhooks) pointing to the server's `/linear/webhook` endpoint
