@@ -104,25 +104,7 @@ export async function startInbound(spool: SpoolClient): Promise<void> {
       if (evt.bot_id || evt.user === myId) return;
       if (evt.subtype && evt.subtype !== "file_share") return;
 
-      // Three intake shapes:
-      //  - `app_mention`: always processed (the user has opted in).
-      //  - `message` in a DM (`channel_type === "im"`): always processed
-      //    (we subscribe to `message.im` and DMs are inherently 1:1).
-      //  - `message` in a channel: only processed if Mega is already
-      //    participating in this Slack thread, i.e. a fork exists. This
-      //    keeps the bot from responding to unrelated channel chatter
-      //    just because it's a member of the channel.
-      const isOptIn =
-        evt.type === "app_mention" || evt.channel_type === "im";
-
-      void publishInbound(
-        spool,
-        thread,
-        evt,
-        data.envelope_id,
-        myId,
-        isOptIn
-      );
+      void publishInbound(spool, thread, evt, data.envelope_id, myId);
     },
   });
 }
@@ -132,30 +114,29 @@ async function publishInbound(
   parent: string,
   evt: any,
   envelopeId: string | undefined,
-  myId: string,
-  isOptIn: boolean
+  myId: string
 ): Promise<void> {
   const channel = evt.channel;
   const ts = evt.ts;
   const threadTs = evt.thread_ts || evt.ts;
   const fork = slackForkName(parent, channel, threadTs);
 
-  // For non-opt-in events (channel messages without an @mention), only
-  // proceed if Mega is already participating in this Slack thread —
-  // i.e. a fork already exists. Stateless across restarts (just a Spool
-  // GET) so we don't need an in-memory active-thread set.
+  // Three intake shapes:
+  //  - `app_mention`: opt-in, always proceed and fork-or-resume the thread.
+  //  - DM (`channel_type === "im"`): same, since DMs are inherently 1:1.
+  //  - Channel `message`: only proceed if Mega is already participating
+  //    in this Slack thread, gated on `threadExists` so unrelated channel
+  //    chatter doesn't trigger Mega.
+  const isOptIn = evt.type === "app_mention" || evt.channel_type === "im";
+  let forkAlreadyExists = false;
   if (!isOptIn) {
-    let exists = false;
     try {
-      exists = await spool.threadExists(fork);
+      forkAlreadyExists = await spool.threadExists(fork);
     } catch (e) {
-      console.warn(
-        `[slack-spool] inbound threadExists(${fork}) failed:`,
-        e
-      );
+      console.warn(`[slack-spool] inbound threadExists(${fork}) failed:`, e);
       return;
     }
-    if (!exists) return;
+    if (!forkAlreadyExists) return;
   }
 
   // 🤔 reaction signals "Mega is thinking"; outbound clears it on reply.
@@ -168,13 +149,15 @@ async function publishInbound(
     console.warn("[slack-spool] reactions.add failed:", err);
   });
 
-  try {
-    // Idempotent: existing forks are 409'd and treated as success by the
-    // client. Server resolves seq_offset to the parent's current tail.
-    await spool.createThread(fork, parent);
-  } catch (e) {
-    console.error("[slack-spool] inbound forkThread failed:", e);
-    return;
+  if (!forkAlreadyExists) {
+    try {
+      // Idempotent: existing forks are 409'd and treated as success by the
+      // client. Server resolves seq_offset to the parent's current tail.
+      await spool.createThread(fork, parent);
+    } catch (e) {
+      console.error("[slack-spool] inbound forkThread failed:", e);
+      return;
+    }
   }
 
   try {
@@ -206,25 +189,22 @@ async function publishInbound(
   }
 }
 
-/** Spawn an outbound consumer on a single fork. The discovery loop in
- *  `core/spool-loop.ts::startSlackV2` calls this once per fork as
- *  `thread.forked` events arrive. Idempotent on `(client_id, fork)` —
- *  a re-spawn on harness restart resumes from the persisted position. */
-export async function startForkOutbound(
-  spool: SpoolClient,
-  fork: string
-): Promise<void> {
-  const cursor = await spool.createCursor(fork, {
-    name: "slack-outbound",
-    filter_ns: "message",
-    filter_type: "end",
-  });
-  console.log(
-    `[slack-spool] outbound: cursor=${cursor.id} on ${fork} from seq=${cursor.cursor_seq}`
-  );
-
+/** Fire-and-forget outbound consumer on a single fork. The discovery
+ *  loop in `core/spool-loop.ts::startSlackV2` calls this once per fork
+ *  as `thread.forked` events arrive. Idempotent on `(client_id, fork)`
+ *  — a re-spawn on harness restart resumes from the persisted position.
+ *  Errors are logged on the loop's own task; the caller doesn't await. */
+export function startForkOutbound(spool: SpoolClient, fork: string): void {
   (async () => {
     try {
+      const cursor = await spool.createCursor(fork, {
+        name: "slack-outbound",
+        filter_ns: "message",
+        filter_type: "end",
+      });
+      console.log(
+        `[slack-spool] outbound: cursor=${cursor.id} on ${fork} from seq=${cursor.cursor_seq}`
+      );
       for await (const ev of spool.tailCursor(cursor.id)) {
         await handleOutbound(ev);
         await spool.ackCursor(cursor.id, ev.seq + 1);

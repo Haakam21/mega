@@ -21,6 +21,18 @@ const AGENTMAIL_SYSTEM_PROMPT =
 const SLACK_SYSTEM_PROMPT =
   "You are responding via Slack. Your final response will be posted verbatim as a Slack message, so make sure it contains only the message text.";
 
+/** Cursor names + event filters used by the v2 Slack consumer. Centralised
+ *  so a typo can't silently create a new cursor or filter to nothing. */
+const SLACK_CURSORS = {
+  discovery: "mega-slack-discovery",
+  inbound: "mega-slack-inbound",
+} as const;
+
+const THREAD_NS = "thread";
+const FORKED_TYPE = "forked";
+const SLACK_NS = "slack";
+const MESSAGE_TYPE = "message";
+
 /** Subscribe + drive Claude. Long-running — drives the loop for the
  *  lifetime of the process. */
 export async function startAgentMailConsumer(
@@ -130,17 +142,18 @@ ${d.text || "(no text content)"}`;
  *  picks that up and posts to Slack.
  *
  *  Idempotent on restart: the discovery cursor's persisted position
- *  replays missed forks; the in-memory `active` set keeps a re-announce
- *  during backfill from double-spawning. */
+ *  replays missed forks; the in-memory `active` set keeps duplicate
+ *  spawns from racing two tail loops on the same cursor (which would
+ *  double-invoke Claude on every event). */
 export async function startSlackV2(
   spool: SpoolClient,
   parent: string
 ): Promise<void> {
   await spool.createThread(parent);
   const discovery = await spool.createCursor(parent, {
-    name: "mega-slack-discovery",
-    filter_ns: "thread",
-    filter_type: "forked",
+    name: SLACK_CURSORS.discovery,
+    filter_ns: THREAD_NS,
+    filter_type: FORKED_TYPE,
   });
   console.log(
     `[spool-loop] slack v2 discovery: cursor=${discovery.id} on ${parent} from seq=${discovery.cursor_seq}`
@@ -162,12 +175,7 @@ export async function startSlackV2(
         if (!active.has(child)) {
           active.add(child);
           spawnSlackForkConsumer(spool, child);
-          void startForkOutbound(spool, child).catch((e) => {
-            console.error(
-              `[spool-loop] slack v2 outbound spawn (${child}) failed:`,
-              e
-            );
-          });
+          startForkOutbound(spool, child);
           console.log(
             `[spool-loop] slack v2: spawned consumer + outbound for ${child}`
           );
@@ -184,9 +192,9 @@ function spawnSlackForkConsumer(spool: SpoolClient, fork: string): void {
   (async () => {
     try {
       const cursor = await spool.createCursor(fork, {
-        name: "mega-slack-inbound",
-        filter_ns: "slack",
-        filter_type: "message",
+        name: SLACK_CURSORS.inbound,
+        filter_ns: SLACK_NS,
+        filter_type: MESSAGE_TYPE,
         seq_mode: "lineage",
       });
       console.log(
