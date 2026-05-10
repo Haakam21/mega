@@ -14,6 +14,7 @@ import {
   slackThread as slackSpoolThread,
   startInbound as startSlackInbound,
 } from "./slack/spool-relay";
+import { start as startLinearSpool } from "./linear/spool-relay";
 
 console.log("Mega agent harness starting...");
 
@@ -49,6 +50,11 @@ if (useSpool) {
       await startSlackV2(spool, parent);
     })();
     channels.push("slack-spool");
+  }
+
+  if (process.env.LINEAR_WEBHOOK_SECRET) {
+    startLinearSpool(spool);
+    channels.push("linear-spool");
   }
 } else {
   if (process.env.AGENTMAIL_API_KEY && process.env.AGENTMAIL_INBOX_ID) {

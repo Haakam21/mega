@@ -177,15 +177,25 @@ The Slack channel runs in two modes selected by `MEGA_USE_SPOOL`:
 - Slack manifest changes require **Reinstall App** before new event subscriptions take effect, but the existing bot token doesn't rotate.
 
 ### How Linear Webhooks Work
-1. Operator creates a webhook in Linear (Settings → API → Webhooks) pointing to the server's `/linear/webhook` endpoint
-2. `linear/channel.ts` starts a Bun HTTP server on `MEGA_LINEAR_PORT` (default 8000)
-3. Linear sends signed POST requests when issues/projects change
-4. The channel verifies the HMAC-SHA256 signature using `LINEAR_WEBHOOK_SECRET`
-5. Only relevant events are processed: issues moving to In Progress / In Review, or projects moving to In Progress
-6. Claude is invoked via `core/invoke.ts` to analyze the item against hygiene rules
-7. If violations are found, Claude notifies Haakam on Slack (DM) with findings and proposed actions
-8. Claude does NOT take action on issues directly — Haakam approves via Slack first
-9. The operator is responsible for exposing the port to the internet (reverse proxy, tunnel, etc.)
+
+The Linear channel runs in two modes selected by `MEGA_USE_SPOOL`:
+
+- **`MEGA_USE_SPOOL=false`** (legacy): `linear/channel.ts` receives webhooks and invokes Claude per event with a hygiene-audit prompt. Claude uses Slack tools to DM Haakam if it finds violations.
+- **`MEGA_USE_SPOOL=true`** (current): `linear/spool-relay.ts` is inbound-only. It verifies the webhook and publishes relevant events to the `linear/hygiene` Spool thread. **No per-webhook Claude invocation** — the thread is a passive audit log Mega can read later (e.g. when Haakam asks "what's been moving on Linear?").
+
+#### Setup (both modes)
+1. Operator creates a webhook in Linear (Settings → API → Webhooks) pointing to the server's `/linear/webhook` endpoint.
+2. The channel starts a Bun HTTP server on `MEGA_LINEAR_PORT` (default 8000).
+3. Linear sends signed POST requests when issues/projects change.
+4. The channel verifies the HMAC-SHA256 signature using `LINEAR_WEBHOOK_SECRET`.
+5. Only relevant events are kept: issues created-in or moved-to In Progress / In Review; projects moving to In Progress. Other events are dropped.
+6. The operator is responsible for exposing the port to the internet (reverse proxy, tunnel, etc.).
+
+#### Spool-relay (v2) details
+- **Thread**: single flat `linear/hygiene` (single-tenant). Multi-workspace would key by workspace id.
+- **Event shape**: `ns=linear, type=webhook`, `data` is the raw Linear payload. Source is `linear.relay@<MEGA_DOMAIN>`.
+- **Dedup**: `id` is `sha256(body)`. Linear webhooks don't carry an explicit delivery id, but each delivery body is unique (per-send timestamp differs). Retries hash identically; distinct events hash differently. Spool dedupes server-side on `id`.
+- **No reply path**: Linear is one-way. Hygiene-audit-on-every-webhook (v1 behavior) is intentionally dropped — too eager and noisy. If the operator wants on-demand audits later, build a separate consumer that tails `linear/hygiene` on a schedule.
 
 ### Testing
 - `make test` — run all tests (unit + E2E)

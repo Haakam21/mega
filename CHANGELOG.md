@@ -2,6 +2,22 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-05-10 — Linear → Spool relay (v2), no per-webhook Claude
+
+Linear is the third and final channel to migrate to the Spool relay topology, completing the v2 cutover (AgentMail and Slack already shipped). Unlike the other two, this v2 path drops the Claude consumer entirely.
+
+- `linear/spool-relay.ts` (new, ~115 LoC) — Bun HTTP webhook server + HMAC verify + `isRelevantEvent` filter + publish to `linear/hygiene` Spool thread. Inbound-only — no consumer in `core/spool-loop.ts`. Webhooks land as `ns=linear, type=webhook` events with `id = sha256(body)` for retry-safe spool-side dedup (Linear doesn't carry a delivery id; body bytes are unique per send).
+- `index.ts` — wired the relay into the `MEGA_USE_SPOOL=true` branch, gated on `LINEAR_WEBHOOK_SECRET`.
+- `linear/spool-relay.test.ts` (new, 17 tests) — covers HMAC verify (good/bad/tampered/empty/short-sig), `isRelevantEvent` filter (8 cases incl. non-state-change updates), `deriveDedupId` (retry-stable, distinct-on-distinct-bodies, sha256 hex shape), and the `LINEAR_HYGIENE_THREAD` constant.
+- `Makefile` — added `linear/spool-relay.test.ts` to `test-unit`.
+- `CLAUDE.md` — rewrote the "How Linear Webhooks Work" section to cover both modes and document the deliberate v2-drops-the-consumer choice.
+
+**Key design call**: Haakam clarified that Linear shouldn't force Claude to respond per webhook — just log to a thread Mega can reference later. The v1 hygiene-on-every-webhook flow was eager and noisy. The thread now serves as a passive audit log; if on-demand audits are wanted later, build a separate consumer that tails `linear/hygiene` on a schedule.
+
+**Subtle fix**: the v1 dedup key was `${type}:${data.id}:${createdAt}` where `createdAt` is the entity's creation timestamp, not the event's. Two updates to the same issue would dedup against each other. v2 uses `sha256(body)` which is strictly unique per delivery and stable across retries.
+
+Tests: **93/93 unit pass** across 10 files (was 76/9). New: `linear/spool-relay.test.ts` (17 cases).
+
 ## 2026-04-21 — Linear webhook channel for hygiene audits
 
 New channel: `linear/channel.ts`. Receives Linear webhook POSTs via a Bun HTTP server, verifies HMAC-SHA256 signatures, filters for issues/projects moving to In Progress or In Review, then invokes Claude to audit against the team's hygiene rules. Violations are reported to Haakam on Slack for approval before any action is taken.
