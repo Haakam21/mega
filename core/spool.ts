@@ -136,6 +136,36 @@ export class SpoolClient {
     return res.json();
   }
 
+  /** List a thread's direct children (forks). Used at startup to
+   *  enumerate existing forks so per-fork consumers can be respawned
+   *  without waiting for a new `thread.forked` event. */
+  async listChildren(parent: string): Promise<{ name: string; parent?: string | null }[]> {
+    const path = `/threads/${encodeURIComponent(parent)}/children`;
+    const res = await this.req("GET", path, {});
+    if (!res.ok) throw await spoolError(res);
+    return res.json();
+  }
+
+  /** Read a slice of events from a thread. Used to derive at-startup
+   *  state from history (e.g. "has Mega already replied in this fork?")
+   *  without standing up a dedicated cursor. */
+  async readEvents(
+    thread: string,
+    opts: { ns?: string; type?: string; limit?: number } = {}
+  ): Promise<SpoolEvent[]> {
+    const params = new URLSearchParams();
+    if (opts.ns) params.set("ns", opts.ns);
+    if (opts.type) params.set("type", opts.type);
+    if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+    const path = `/threads/${encodeURIComponent(thread)}/events${
+      params.toString() ? `?${params}` : ""
+    }`;
+    const res = await this.req("GET", path, {});
+    if (!res.ok) throw await spoolError(res);
+    const body = (await res.json()) as { events: SpoolEvent[] };
+    return body.events;
+  }
+
   /**
    * SSE tail: backfill from the cursor's persisted position then emit
    * live events. Yields events as they arrive; never auto-acks. Caller

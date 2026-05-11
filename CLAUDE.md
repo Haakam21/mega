@@ -171,7 +171,7 @@ Flow:
 - `bot_id` / `app_id` / `subtype=bot_message` → skip. Stops the bot from re-invoking on its own replies.
 - `type=app_mention` → respond.
 - `channel_type=im` → respond (DM).
-- `type=message` in a fork Mega has already replied to (`SLACK_REPLIED_FORKS` Set) → respond (follow-up). Reset on Mega restart; first app_mention/DM in a fork re-seeds it.
+- `type=message` in a fork Mega has already replied to (`SLACK_REPLIED_FORKS` Set) → respond (follow-up). On consumer spawn, `primeSlackRepliedForks` reads the fork for any prior `ns=message, type=end` event and seeds the set — so restart re-derives state from Spool history instead of forgetting it. Updated live on every successful publish.
 
 `thread_ts ?? ts`: top-level @mentions don't carry `thread_ts` (Slack only sets it on replies-in-threads). Consumer falls back to `ts`, so the outbound reply lands in-thread.
 

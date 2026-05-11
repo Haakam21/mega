@@ -72,6 +72,12 @@ export async function startAgentMailV2(
 
   const active = new Set<string>();
 
+  // Spawn consumers for forks that already exist. The discovery cursor
+  // doesn't replay thread.forked events it has already ack'd, so without
+  // this Mega would never reconnect to a fork created before the last
+  // restart. Spool's listChildren is authoritative.
+  await respawnExistingForks(spool, parent, active, spawnAgentMailForkConsumer, "agentmail");
+
   (async () => {
     try {
       for await (const ev of spool.tailCursor(discovery.id)) {
@@ -96,6 +102,34 @@ export async function startAgentMailV2(
       console.error("[spool-loop] agentmail v2 discovery tail failed:", e);
     }
   })();
+}
+
+/** Enumerate existing children of the parent thread and spawn a per-fork
+ *  consumer for each. Idempotent via the caller's `active` set — a fork
+ *  that later surfaces as a `thread.forked` event won't be double-spawned. */
+async function respawnExistingForks(
+  spool: SpoolClient,
+  parent: string,
+  active: Set<string>,
+  spawn: (spool: SpoolClient, fork: string) => void,
+  label: string
+): Promise<void> {
+  try {
+    const children = await spool.listChildren(parent);
+    for (const child of children) {
+      if (!active.has(child.name)) {
+        active.add(child.name);
+        spawn(spool, child.name);
+        console.log(
+          `[spool-loop] ${label} v2: respawned consumer for ${child.name}`
+        );
+      }
+    }
+  } catch (e) {
+    console.warn(
+      `[spool-loop] ${label} v2: respawnExistingForks (${parent}) failed: ${(e as Error).message}`
+    );
+  }
 }
 
 function spawnAgentMailForkConsumer(spool: SpoolClient, fork: string): void {
@@ -222,6 +256,8 @@ export async function startSlackV2(
 
   const active = new Set<string>();
 
+  await respawnExistingForks(spool, parent, active, spawnSlackForkConsumer, "slack");
+
   (async () => {
     try {
       for await (const ev of spool.tailCursor(discovery.id)) {
@@ -251,6 +287,7 @@ export async function startSlackV2(
 function spawnSlackForkConsumer(spool: SpoolClient, fork: string): void {
   (async () => {
     try {
+      await primeSlackRepliedForks(spool, fork);
       const cursor = await spool.createCursor(fork, {
         name: SLACK_CURSORS.inbound,
         filter_ns: SLACK_NS,
@@ -278,9 +315,34 @@ function spawnSlackForkConsumer(spool: SpoolClient, fork: string): void {
 
 /** Per-fork "I've replied here before" memory. Lets us follow up on
  *  channel-thread messages in conversations Mega has already engaged
- *  with, without responding to unrelated channel chatter. Reset on
- *  process restart; first app_mention or DM in a fork re-seeds it. */
+ *  with, without responding to unrelated channel chatter. The set is
+ *  derived from Spool history on consumer spawn (see
+ *  `primeSlackRepliedForks`) and topped up live in `handleSlackInbound`
+ *  after each successful publish — so a restart re-derives state from
+ *  the durable record instead of forgetting it. */
 const SLACK_REPLIED_FORKS = new Set<string>();
+
+/** Seed `SLACK_REPLIED_FORKS` for a fork by checking Spool for any
+ *  prior `ns=message, type=end` event. Failures degrade gracefully:
+ *  the consumer still runs, just without follow-up tracking until the
+ *  next @mention/DM re-seeds. */
+async function primeSlackRepliedForks(
+  spool: SpoolClient,
+  fork: string
+): Promise<void> {
+  try {
+    const past = await spool.readEvents(fork, {
+      ns: "message",
+      type: "end",
+      limit: 1,
+    });
+    if (past.length > 0) SLACK_REPLIED_FORKS.add(fork);
+  } catch (e) {
+    console.warn(
+      `[spool-loop] slack v2: primeSlackRepliedForks (${fork}) failed: ${(e as Error).message}`
+    );
+  }
+}
 
 function shouldRespondSlack(ev: SpoolEvent, fork: string): boolean {
   const d = ev.data as {
