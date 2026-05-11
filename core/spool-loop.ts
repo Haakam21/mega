@@ -294,6 +294,15 @@ async function primeSlackRepliedForks(
   }
 }
 
+/** True iff the event is directly addressed to the bot — `app_mention` or a
+ *  DM (`channel_type=im`). Fabric's slack-inbound reacts thinking-emoji on
+ *  these immediately; for everything else the consumer routes its own ack
+ *  back through Spool to fabric's outbound. */
+export function isDirectAddressSlack(ev: SpoolEvent): boolean {
+  const d = ev.data as { type?: unknown; channel_type?: unknown };
+  return d.type === "app_mention" || d.channel_type === "im";
+}
+
 /** Slack delivers a single @mention as both an `app_mention` envelope and
  *  a `message.channels` envelope, each with a distinct top-level event_id.
  *  Dedup the per-message work by the inner `(channel, ts)` pair, which is
@@ -358,6 +367,26 @@ async function handleSlackInbound(
   // defer until a tenant complains.
   const prompt = buildSlackPrompt(ev);
   const sessionId = `slack-${channel}-${threadTs}`;
+
+  // Fabric's inbound only reacts thinking-emoji on directly-addressed
+  // events (app_mention + DM). For follow-up replies in already-replied
+  // threads the consumer publishes a `ns=message, type=ack` event so
+  // fabric's outbound mirrors the same UX. Awaited (not fire-and-forget)
+  // so the ack is processed before the `message.end` that follows.
+  if (!isDirectAddressSlack(ev)) {
+    await spool
+      .publish(thread, [
+        {
+          ns: "message",
+          type: "ack",
+          source: `mega@${process.env.MEGA_DOMAIN ?? "india-desert.exe.xyz"}`,
+          data: { channel, ts },
+        },
+      ])
+      .catch((err) =>
+        console.warn(`[spool-loop] slack: ack publish failed: ${(err as Error).message}`),
+      );
+  }
 
   const handle = invokeWithHandle({
     eventId: slackDedupId(ev),

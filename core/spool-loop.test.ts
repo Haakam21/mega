@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { slackDedupId } from "./spool-loop";
+import { isDirectAddressSlack, slackDedupId } from "./spool-loop";
 import type { SpoolEvent } from "./spool";
 
 function ev(data: Record<string, unknown>, extra: Partial<SpoolEvent> = {}): SpoolEvent {
@@ -50,5 +50,20 @@ describe("slackDedupId", () => {
   test("falls back to spool-seq when nothing else is available", () => {
     const ev0 = { seq: 42, thread: "slack/x", ns: "slack", type: "x", id: "", time: "", data: {} } as SpoolEvent;
     expect(slackDedupId(ev0)).toBe("spool-seq-42");
+  });
+});
+
+describe("isDirectAddressSlack", () => {
+  test("true for app_mention", () => {
+    expect(isDirectAddressSlack(ev({ type: "app_mention", channel: "C9", ts: "1" }))).toBe(true);
+  });
+  test("true for DM (channel_type=im)", () => {
+    expect(isDirectAddressSlack(ev({ type: "message", channel_type: "im", channel: "D1", ts: "1" }))).toBe(true);
+  });
+  test("false for message in a channel", () => {
+    expect(isDirectAddressSlack(ev({ type: "message", channel: "C9", ts: "1" }))).toBe(false);
+  });
+  test("false for unknown event shapes", () => {
+    expect(isDirectAddressSlack(ev({}))).toBe(false);
   });
 });
