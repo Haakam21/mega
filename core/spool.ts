@@ -136,9 +136,6 @@ export class SpoolClient {
     return res.json();
   }
 
-  /** List a thread's direct children (forks). Used at startup to
-   *  enumerate existing forks so per-fork consumers can be respawned
-   *  without waiting for a new `thread.forked` event. */
   async listChildren(parent: string): Promise<{ name: string; parent?: string | null }[]> {
     const path = `/threads/${encodeURIComponent(parent)}/children`;
     const res = await this.req("GET", path, {});
@@ -146,9 +143,6 @@ export class SpoolClient {
     return res.json();
   }
 
-  /** Read a slice of events from a thread. Used to derive at-startup
-   *  state from history (e.g. "has Mega already replied in this fork?")
-   *  without standing up a dedicated cursor. */
   async readEvents(
     thread: string,
     opts: { ns?: string; type?: string; limit?: number } = {}

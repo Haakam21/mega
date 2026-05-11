@@ -42,41 +42,49 @@ const SLACK_NS = "slack";
 const AGENTMAIL_NS = "agentmail";
 const MESSAGE_TYPE = "message";
 
-/** AgentMail v2 consumer (fabric-fork model).
- *
- *  Mirrors `startSlackV2`. Tails a discovery cursor on the bot's parent
- *  thread filtered to `thread.forked` events; fabric's webhook publishes
- *  each inbound email into a forked child thread `<parent>/<email_thread_id>`,
- *  which surfaces as a thread.forked event on the parent. Each fork
- *  triggers a per-fork inbound consumer that reads
- *  `ns=agentmail, type=message` events in lineage mode, invokes Claude
- *  with sessionId = fork name, and publishes `message.end` back to the
- *  fork. Fabric's outbound supervisor (with fork=true on the matching
- *  outbound binding) picks up message.end and calls AgentMail's reply API.
- *
- *  Mega no longer owns inbound webhook receipt or outbound reply
- *  dispatch — fabric does both. */
-export async function startAgentMailV2(
+/** Generic forked-channel inbound: tails a discovery cursor on the parent
+ *  thread for `thread.forked` events, spawning a per-fork consumer for each
+ *  child. On startup, also enumerates existing children via
+ *  `spool.listChildren` and respawns those — the discovery cursor doesn't
+ *  replay already-ack'd forks, so without this Mega would never reconnect
+ *  to a fork created before the last restart. */
+type ChannelLabel = "slack" | "agentmail";
+async function startForkedChannel(
   spool: SpoolClient,
-  parent: string
+  parent: string,
+  cfg: {
+    label: ChannelLabel;
+    discoveryCursor: string;
+    spawn: (spool: SpoolClient, fork: string) => void;
+  }
 ): Promise<void> {
   await spool.createThread(parent);
   const discovery = await spool.createCursor(parent, {
-    name: AGENTMAIL_CURSORS.discovery,
+    name: cfg.discoveryCursor,
     filter_ns: THREAD_NS,
     filter_type: FORKED_TYPE,
   });
   console.log(
-    `[spool-loop] agentmail v2 discovery: cursor=${discovery.id} on ${parent} from seq=${discovery.cursor_seq}`
+    `[spool-loop] ${cfg.label} v2 discovery: cursor=${discovery.id} on ${parent} from seq=${discovery.cursor_seq}`
   );
 
   const active = new Set<string>();
 
-  // Spawn consumers for forks that already exist. The discovery cursor
-  // doesn't replay thread.forked events it has already ack'd, so without
-  // this Mega would never reconnect to a fork created before the last
-  // restart. Spool's listChildren is authoritative.
-  await respawnExistingForks(spool, parent, active, spawnAgentMailForkConsumer, "agentmail");
+  try {
+    for (const child of await spool.listChildren(parent)) {
+      if (!active.has(child.name)) {
+        active.add(child.name);
+        cfg.spawn(spool, child.name);
+        console.log(
+          `[spool-loop] ${cfg.label} v2: respawned consumer for ${child.name}`
+        );
+      }
+    }
+  } catch (e) {
+    console.warn(
+      `[spool-loop] ${cfg.label} v2: listChildren (${parent}) failed: ${(e as Error).message}`
+    );
+  }
 
   (async () => {
     try {
@@ -84,52 +92,38 @@ export async function startAgentMailV2(
         const child = ev.data?.child as string | undefined;
         if (!child) {
           console.warn(
-            `[spool-loop] agentmail v2 discovery: malformed thread.forked event seq=${ev.seq}`
+            `[spool-loop] ${cfg.label} v2 discovery: malformed thread.forked event seq=${ev.seq}`
           );
           await spool.ackCursor(discovery.id, ev.seq + 1);
           continue;
         }
         if (!active.has(child)) {
           active.add(child);
-          spawnAgentMailForkConsumer(spool, child);
+          cfg.spawn(spool, child);
           console.log(
-            `[spool-loop] agentmail v2: spawned consumer for ${child}`
+            `[spool-loop] ${cfg.label} v2: spawned consumer for ${child}`
           );
         }
         await spool.ackCursor(discovery.id, ev.seq + 1);
       }
     } catch (e) {
-      console.error("[spool-loop] agentmail v2 discovery tail failed:", e);
+      console.error(`[spool-loop] ${cfg.label} v2 discovery tail failed:`, e);
     }
   })();
 }
 
-/** Enumerate existing children of the parent thread and spawn a per-fork
- *  consumer for each. Idempotent via the caller's `active` set — a fork
- *  that later surfaces as a `thread.forked` event won't be double-spawned. */
-async function respawnExistingForks(
+/** Fabric-fork inbound for AgentMail: fabric publishes each email thread
+ *  into a forked child of the parent; one Claude session per fork; replies
+ *  published as `message.end` and dispatched by fabric's outbound. */
+export async function startAgentMailV2(
   spool: SpoolClient,
-  parent: string,
-  active: Set<string>,
-  spawn: (spool: SpoolClient, fork: string) => void,
-  label: string
+  parent: string
 ): Promise<void> {
-  try {
-    const children = await spool.listChildren(parent);
-    for (const child of children) {
-      if (!active.has(child.name)) {
-        active.add(child.name);
-        spawn(spool, child.name);
-        console.log(
-          `[spool-loop] ${label} v2: respawned consumer for ${child.name}`
-        );
-      }
-    }
-  } catch (e) {
-    console.warn(
-      `[spool-loop] ${label} v2: respawnExistingForks (${parent}) failed: ${(e as Error).message}`
-    );
-  }
+  return startForkedChannel(spool, parent, {
+    label: "agentmail",
+    discoveryCursor: AGENTMAIL_CURSORS.discovery,
+    spawn: spawnAgentMailForkConsumer,
+  });
 }
 
 function spawnAgentMailForkConsumer(spool: SpoolClient, fork: string): void {
@@ -227,61 +221,19 @@ Inbox ID: ${d.inbox_id}
 ${d.text || "(no text content)"}`;
 }
 
-/** Slack v2 consumer. Tails a discovery cursor on the bot's root thread
- *  filtered to `thread.forked` events; spawns a per-fork inbound consumer
- *  + outbound relay each time a new fork is announced. Each per-fork
- *  inbound consumer reads `ns=slack, type=message` events in `Lineage`
- *  mode (transparently walking the parent if it ever got events before
- *  the fork existed), invokes Claude with sessionId = fork name, and
- *  publishes `message.end` back to the same fork — the outbound consumer
- *  picks that up and posts to Slack.
- *
- *  Idempotent on restart: the discovery cursor's persisted position
- *  replays missed forks; the in-memory `active` set keeps duplicate
- *  spawns from racing two tail loops on the same cursor (which would
- *  double-invoke Claude on every event). */
+/** Fabric-fork inbound for Slack: each Slack thread is a forked child
+ *  of the parent; per-fork consumer reads in lineage mode, invokes Claude
+ *  with `sessionId = <fork>`, publishes `message.end`. Fabric's outbound
+ *  posts the reply via `chat.postMessage`. */
 export async function startSlackV2(
   spool: SpoolClient,
   parent: string
 ): Promise<void> {
-  await spool.createThread(parent);
-  const discovery = await spool.createCursor(parent, {
-    name: SLACK_CURSORS.discovery,
-    filter_ns: THREAD_NS,
-    filter_type: FORKED_TYPE,
+  return startForkedChannel(spool, parent, {
+    label: "slack",
+    discoveryCursor: SLACK_CURSORS.discovery,
+    spawn: spawnSlackForkConsumer,
   });
-  console.log(
-    `[spool-loop] slack v2 discovery: cursor=${discovery.id} on ${parent} from seq=${discovery.cursor_seq}`
-  );
-
-  const active = new Set<string>();
-
-  await respawnExistingForks(spool, parent, active, spawnSlackForkConsumer, "slack");
-
-  (async () => {
-    try {
-      for await (const ev of spool.tailCursor(discovery.id)) {
-        const child = ev.data?.child as string | undefined;
-        if (!child) {
-          console.warn(
-            `[spool-loop] slack v2 discovery: malformed thread.forked event seq=${ev.seq}`
-          );
-          await spool.ackCursor(discovery.id, ev.seq + 1);
-          continue;
-        }
-        if (!active.has(child)) {
-          active.add(child);
-          spawnSlackForkConsumer(spool, child);
-          console.log(
-            `[spool-loop] slack v2: spawned consumer for ${child}`
-          );
-        }
-        await spool.ackCursor(discovery.id, ev.seq + 1);
-      }
-    } catch (e) {
-      console.error("[spool-loop] slack v2 discovery tail failed:", e);
-    }
-  })();
 }
 
 function spawnSlackForkConsumer(spool: SpoolClient, fork: string): void {
@@ -322,10 +274,8 @@ function spawnSlackForkConsumer(spool: SpoolClient, fork: string): void {
  *  the durable record instead of forgetting it. */
 const SLACK_REPLIED_FORKS = new Set<string>();
 
-/** Seed `SLACK_REPLIED_FORKS` for a fork by checking Spool for any
- *  prior `ns=message, type=end` event. Failures degrade gracefully:
- *  the consumer still runs, just without follow-up tracking until the
- *  next @mention/DM re-seeds. */
+/** On prime failure the consumer still runs — just without follow-up
+ *  tracking until the next @mention/DM re-seeds the set. */
 async function primeSlackRepliedForks(
   spool: SpoolClient,
   fork: string
