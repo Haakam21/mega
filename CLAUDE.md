@@ -155,39 +155,48 @@ Mega-side:
 1. Set `MEGA_AGENTMAIL_PARENT=mega/agentmail` in `.env`.
 2. Restart the harness; `startAgentMailV2` initializes the discovery cursor and waits for forks.
 
-### How Slack Works
+### How Slack Works (fabric-brokered)
 
-Inbound arrives via Slack-signed HTTPS Events API deliveries at `/slack/webhook` (`slack/webhook.ts`). The handler verifies the signature, dispatches asynchronously (Slack's 3-second budget), and routes through `handleSlackEvent` in `slack/spool-relay.ts`. The Mega consumer (`core/spool-loop.ts::startSlackV2`) tails each per-Slack-thread fork and invokes Claude; replies route back through the same fork via `slack/spool-relay.ts::startForkOutbound` → `chat.postMessage`.
+Same shape as AgentMail — Mega doesn't receive Slack webhooks directly. Fabric (`https://fabric.delivery`) handles inbound (signature verify, 🤔 reaction, fork-per-Slack-thread publish) and outbound (`chat.postMessage` + 🤔 cleanup). Mega is a Spool consumer.
+
+Flow:
+1. Slack delivers an Events API webhook to `https://fabric.delivery/slack/webhook/<connector_id>`.
+2. Fabric verifies the `v0=<hex>` signature, handles `url_verification` if present, parses the `event_callback`, fires `reactions.add({channel, ts, name: thinking_face})` fire-and-forget (skipped for bot-authored events to prevent loops), and publishes `ns=slack, type=<event.type>` (app_mention, message, etc.) into the forked child thread `<MEGA_SLACK_PARENT>/<channel>-<thread_ts ?? ts>`.
+3. Mega's `startSlackV2(spool, MEGA_SLACK_PARENT)` tails the parent's discovery cursor (filter `ns=thread, type=forked`). Each new fork spawns a per-fork inbound consumer (filter `ns=slack`, no type filter — discriminates in `shouldRespondSlack`).
+4. The per-fork consumer invokes Claude with `sessionId = <fork name>`. Session continuity gives Claude prior turns; no Slack history fetch.
+5. Claude's response is published as `ns=message, type=end` back to the same fork, with `{channel, thread_ts, ts}` carried through.
+6. Fabric's outbound supervisor tails per-fork for `message.end`, calls `chat.postMessage`, then `reactions.remove` (best-effort).
+
+`shouldRespondSlack` filter (consumer):
+- `bot_id` / `app_id` / `subtype=bot_message` → skip. Stops the bot from re-invoking on its own replies.
+- `type=app_mention` → respond.
+- `channel_type=im` → respond (DM).
+- `type=message` in a fork Mega has already replied to (`SLACK_REPLIED_FORKS` Set) → respond (follow-up). Reset on Mega restart; first app_mention/DM in a fork re-seeds it.
+
+`thread_ts ?? ts`: top-level @mentions don't carry `thread_ts` (Slack only sets it on replies-in-threads). Consumer falls back to `ts`, so the outbound reply lands in-thread.
 
 #### Setup
-1. Create or update the Slack app at api.slack.com using `slack/manifest.json`. The manifest sets `event_subscriptions.request_url = https://india-desert.exe.xyz/slack/webhook` and `socket_mode_enabled: false`. Bot events: `app_mention`, `message.im`, `message.channels`, `message.groups`, `message.mpim`, `assistant_thread_started`, `assistant_thread_context_changed`. Scopes: `*:history` + `chat:write` + `reactions:write` + others (see manifest).
-2. Grab the **Signing Secret** from the app's "Basic Information" page → `SLACK_SIGNING_SECRET` in `.env`.
-3. Install to workspace → `SLACK_BOT_TOKEN`. No app-level token needed.
-4. Mega appears in Slack's **Agents** tab (via `assistant_view` feature in manifest). Mega can proactively DM users via `conversations.open` + `chat.postMessage` (uses `im:write` scope).
-   - Haakam's Slack user ID: `U08TMCS2KRT`, DM channel: `D0AS9T5CP4K`.
+Operator-side (one-time):
+1. Create the fabric Slack connector:
+   ```
+   POST https://fabric.delivery/v1/connectors  X-Client-Id: mega@<MEGA_DOMAIN>
+   { type: "slack", mode: "both",
+     config: { signing_secret, bot_token, thinking_emoji: "thinking_face" } }
+   ```
+2. Update `slack/manifest.json` `event_subscriptions.request_url` to `https://fabric.delivery/slack/webhook/<connector_id>`. Paste manifest into api.slack.com → app → App Manifest → Save Changes → Install/Reinstall App.
+3. Create the Spool parent thread (e.g. `slack/<bot_user_id>`) under Mega's `X-Client-Id`; invite `fabric-prod` as `writer`.
+4. Create inbound + outbound bindings on the connector with `fork: true` and `thread: <parent>`.
 
-#### Webhook verification
-- HMAC-SHA256 over `v0:${x-slack-request-timestamp}:${raw-body}` keyed by the signing secret as a plain-string key. Header `x-slack-signature` carries `v0=<hex>`. 5-minute replay window. Constant-time compare on the full `v0=<hex>` string.
-- One-time `type: "url_verification"` handshake: echo the `challenge` field back as plain text.
-- 3-second response budget — event processing dispatches asynchronously so Spool/Slack-API latencies don't trigger retries.
+Mega-side:
+1. Set `MEGA_SLACK_PARENT=slack/<bot_user_id>` in `.env`.
+2. Restart; `startSlackV2` initializes the discovery cursor and waits for forks.
 
-#### Spool topology
-- **Root thread** `slack/<bot_user_id>` carries only `thread.forked` audit events. No user messages live here.
-- **Per-Slack-thread fork** `slack/<bot>/<channel>/<thread_ts>` carries the full conversation: `ns=slack/type=message` (inbound) + `ns=message/type=end` (outbound).
-- **Discovery cursor** on the root, filtered to `ns=thread/type=forked`, drives `startSlackV2`. Every new fork triggers two per-fork tails: an inbound consumer (filter `slack/message`, `seq_mode: lineage`) and an outbound relay (filter `message/end`).
-- **Inbound intake** in `publishInbound`:
-  - `app_mention` and DM (`channel_type === "im"`) — opt-in, always fork-or-resume.
-  - Other channel `message` — only proceed if the fork already exists (`spool.threadExists`); keeps Mega from responding to unrelated channel chatter just because it's a member.
-- **Dedup**: Slack delivers a single user @mention as both `app_mention` and `message.{groups,channels}` with different `event_id`s. The spool publish uses `id: ${channel}:${ts}` so spool dedupes them server-side.
-- 🤔 reaction on the latest message indicates thinking; outbound clears it on reply.
-- Thread context recovery: every invocation fetches Slack thread history via `conversations.replies` and prepends it to the prompt, so a fresh Claude session still has full context.
-- Claude session id is `slack-${channel}-${thread_ts}`.
-- **Outbound resilience**: `startForkOutbound` wraps each iteration's `handleOutbound` in a per-event try/catch — a single bad `chat.postMessage` (channel archived, bot kicked, transient 5xx) logs + advances; the tail keeps running.
+Haakam's Slack user ID: `U08TMCS2KRT`, DM channel: `D0AS9T5CP4K`. Mega's bot_user_id: `U0ATAH16PPA`.
 
-#### Live test gotchas (recorded 2026-05-08)
-- `C…` channel ids cover both public AND private channels; `conversations.replies` returning `missing_scope: groups:history` is the giveaway. Hence `message.groups` + `groups:history` in the manifest.
-- `assistant_view` does not redirect channel events — `app_mention` + `message.*` still fire normally.
-- Slack manifest changes require **Reinstall App** before new event subscriptions take effect, but the existing bot token doesn't rotate.
+#### Slack-side notes (carried over from pre-fabric)
+- `C…` channel ids cover both public AND private channels — `message.groups` + `groups:history` must be in the manifest scopes.
+- Slack manifest changes require **Reinstall App** before new event subscriptions take effect; the existing bot token doesn't rotate.
+- Slack delivers @mentions as BOTH `app_mention` and `message.channels` events. Both reach the same fork; Mega's invoke dedup (`.seen_events`) prevents double-firing Claude on the same Slack `event_id`.
 
 ### How Linear Webhooks Work
 
