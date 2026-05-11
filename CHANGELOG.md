@@ -2,6 +2,30 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-05-11 — Slack on Events API + v1 channels decommissioned
+
+Cuts the last WebSocket out of the runtime and finishes the migration to a single webhook-based architecture.
+
+**Slack: Socket Mode → Events API webhook** (commit `3e18dc0` + `a8a53e7`)
+- `slack/webhook.ts` — verifies `x-slack-signature` HMAC over `v0:${ts}:${body}`, handles `url_verification` handshake, dispatches `event_callback` asynchronously to fit the 3-second budget. Adds a `[slack-webhook] <type> from <user> in <channel>` log line for visibility.
+- `slack/spool-relay.ts` — extracted `handleSlackEvent` shared intake; deleted `startInbound` + Socket Mode WebSocket plumbing.
+- `slack/spool-relay.ts::startForkOutbound` — preemptive per-event try/catch (same bug shape that bit AgentMail's outbound on 2026-05-11; surfaced via a synthetic 404 then).
+- `slack/manifest.json` — `socket_mode_enabled: false`, added `event_subscriptions.request_url`.
+- Live verification: signing secret in `.env`, manifest pasted to Slack and reinstalled. URL verification challenge passed. DM to Mega fired `[slack-webhook] message from <U…> in <D…>`, downstream consumer invoked Claude, reply posted via the per-fork outbound. Zero Socket Mode activity in the new harness's log.
+- Signing secret leaked into the session transcript when Haakam shared it for the initial `.env` write; rotated via the Slack app's "Regenerate" button immediately after the round-trip verified.
+
+**v1 channels decommissioned + `core/websocket.ts` deleted**
+- Deleted: `agentmail/channel.ts`, `agentmail/channel.test.ts`, `slack/channel.ts`, `slack/channel.test.ts`, `linear/channel.ts`, `core/websocket.ts`, `core/websocket.test.ts`.
+- `index.ts` — removed the `MEGA_USE_SPOOL` branch entirely. Single code path. Channel start gated on its required env vars.
+- `.env.example` — dropped `MEGA_USE_SPOOL`, `MEGA_LINEAR_PORT`, `SLACK_APP_TOKEN`, `MEGA_AGENTMAIL_MAX_CONCURRENT`, `MEGA_AGENTMAIL_MAX_QUEUE`. None of these env vars are read anywhere now.
+- `Makefile` — dropped the deleted test files from `test-unit`.
+- `CLAUDE.md` — rewrote "How Email/Slack/Linear Works" sections to drop two-modes framing. Dropped the legacy concurrency knobs from the process-safety table. Updated project structure + channel description.
+- Bundle size dropped from 56KB → 38KB (~32% reduction). 92/92 unit tests pass (down from 116 — the dropped tests covered the v1 direct channels' `buildPrompt` / queueing / interrupt-and-merge logic that no longer exists).
+
+**Architecture state after this commit**: every inbound event arrives as a signed HTTPS webhook on the shared `core/http-server.ts` (port 8000, path-routed). Three channels, three webhook paths, one bus (Spool), one consumer loop. No WebSocket clients anywhere in the runtime.
+
+**Follow-ups deferred**: nothing pressing. The AgentMail webhook secret still wants rotating via the AgentMail dashboard (was leaked into a transcript 2026-05-11 morning when registering). The Slack signing secret was rotated mid-session above.
+
 ## 2026-05-11 — AgentMail: WebSocket → webhook + shared HTTP server
 
 Replaced AgentMail's WebSocket inbound (`wss://ws.agentmail.to/v0`) with an HTTPS webhook at `/agentmail/webhook`. AgentMail signs with Svix; the handler verifies HMAC-SHA256 over `${svix-id}.${svix-timestamp}.${body}` keyed by the base64-decoded `whsec_` secret, with a 5-min replay window. Spool dedup id stays as `payload.event_id` so a parallel WebSocket delivery (during migration) and webhook retries all collide on the same id.
