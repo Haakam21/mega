@@ -141,7 +141,7 @@ async function handleAgentMailInbound(
 
   const prompt = buildAgentMailPrompt(ev);
   const handle = invokeWithHandle({
-    eventId: ev.data.event_id ?? `spool-seq-${ev.seq}`,
+    eventId: ev.data.event_id ?? ev.id ?? `spool-seq-${thread}-${ev.seq}`,
     sessionId: thread,
     prompt,
     systemPrompt: AGENTMAIL_SYSTEM_PROMPT,
@@ -336,7 +336,7 @@ async function handleSlackInbound(
   const sessionId = `slack-${channel}-${threadTs}`;
 
   const handle = invokeWithHandle({
-    eventId: ev.data.event_id ?? `spool-seq-${ev.seq}`,
+    eventId: ev.data.event_id ?? ev.id ?? `spool-seq-${thread}-${ev.seq}`,
     sessionId,
     prompt,
     systemPrompt: SLACK_SYSTEM_PROMPT,
