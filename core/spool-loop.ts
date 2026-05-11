@@ -24,7 +24,11 @@ const SLACK_SYSTEM_PROMPT =
  *  create a new cursor or filter to nothing. */
 const SLACK_CURSORS = {
   discovery: "mega-slack-discovery",
-  inbound: "mega-slack-inbound",
+  // Bumped to -v2 when we moved off the pre-fabric publish scheme that
+  // emitted every event as `type=message`. Fabric publishes with the
+  // actual Slack event type (app_mention, message, etc.), so we drop
+  // the type filter and discriminate in shouldRespondSlack.
+  inbound: "mega-slack-inbound-v2",
 } as const;
 
 const AGENTMAIL_CURSORS = {
@@ -250,7 +254,9 @@ function spawnSlackForkConsumer(spool: SpoolClient, fork: string): void {
       const cursor = await spool.createCursor(fork, {
         name: SLACK_CURSORS.inbound,
         filter_ns: SLACK_NS,
-        filter_type: MESSAGE_TYPE,
+        // No filter_type — fabric publishes with the actual Slack event
+        // type (app_mention, message, etc.). shouldRespondSlack
+        // discriminates per-event.
         seq_mode: "lineage",
       });
       console.log(
@@ -277,7 +283,21 @@ function spawnSlackForkConsumer(spool: SpoolClient, fork: string): void {
 const SLACK_REPLIED_FORKS = new Set<string>();
 
 function shouldRespondSlack(ev: SpoolEvent, fork: string): boolean {
-  const d = ev.data as { type?: unknown; channel_type?: unknown };
+  const d = ev.data as {
+    type?: unknown;
+    channel_type?: unknown;
+    bot_id?: unknown;
+    subtype?: unknown;
+    app_id?: unknown;
+  };
+  // Bot-authored messages — most importantly Mega's own replies — must
+  // not re-enter the consumer loop. Slack tags bot messages via bot_id
+  // (the bot's id, set on every bot-originated message in any channel),
+  // app_id (the originating app), and/or subtype:"bot_message".
+  if (typeof d.bot_id === "string") return false;
+  if (typeof d.app_id === "string") return false;
+  if (d.subtype === "bot_message") return false;
+
   if (d.type === "app_mention") return true;
   if (d.channel_type === "im") return true;
   if (d.type === "message" && SLACK_REPLIED_FORKS.has(fork)) return true;
@@ -294,11 +314,15 @@ async function handleSlackInbound(
     return;
   }
   const channel = ev.data.channel as string | undefined;
-  const threadTs = ev.data.thread_ts as string | undefined;
   const ts = ev.data.ts as string | undefined;
+  // Top-level app_mentions have no thread_ts — Slack only sets it on
+  // replies-in-threads. The message's own ts becomes the thread_ts as
+  // soon as anyone (including the bot) replies. Mirror that here so the
+  // outbound reply lands in-thread.
+  const threadTs = (ev.data.thread_ts as string | undefined) ?? ts;
   if (!channel || !threadTs || !ts) {
     console.warn(
-      `[spool-loop] slack: skipping seq=${ev.seq} (missing channel/thread_ts/ts)`
+      `[spool-loop] slack: skipping seq=${ev.seq} (missing channel/ts)`
     );
     return;
   }
