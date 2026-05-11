@@ -2,6 +2,30 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-05-11 (session 2) — Fabric HA + Mega fork-restart durability
+
+Followed up on the fabric cutover. Three fabric/mega changes that unblock prod scaling, fix a silent dedup-collision bug, and make Slack/AgentMail consumers survive a restart cleanly.
+
+**Fabric leader election** (fabric commits `4ec2b13`, `861eb45`)
+- `src/core/leader.ts`: `pg_try_advisory_lock`-gated outbound supervisor. Any number of fabric tasks accept webhooks + serve `/v1`; only the lock-holder runs the supervisor and dispatches. Standbys poll every 1s; graceful shutdown releases explicitly so peer picks up sub-second. Mirrors spool's `crates/spool-relay/src/leader.rs`.
+- Shared `src/core/async.ts` (`sleep`, `waitForAbort`) extracted out of the duplicated supervisor helper.
+- Prod `desiredCount: 1 → 2` (`infra/Pulumi.prod.yaml`). Acceptance: send Slack DM → exactly one reply.
+- New tests: 5 leader-election integration tests + 1 supervisor pause/resume cursor-persistence test. FakeSpool SSE handler fidelity fix (now filters events to seq ≥ cursor.cursor_seq, mirroring real Spool).
+
+**Mega per-event dedup key fix** (mega commit `3e30c20`)
+- Acceptance failed first try: @mention reached fabric (🤔 emoji ack visible) but no reply. Mega's `.seen_events` dedup key was `spool-seq-${seq}` — global, not fork-scoped. New fork's seq=32 collided with an earlier fork's seq=32 in the dedup log, silently skipping the invoke.
+- Fixed to `ev.data.event_id ?? ev.id ?? spool-seq-${thread}-${seq}`. `ev.id` is Spool's globally-unique event id (fabric sets it to `sha256(body)` or the provider event_id). Last-resort fallback is thread-scoped.
+
+**Mega fork-restart durability** (mega commits `41e1ec5`, `82c17a6`)
+- `SLACK_REPLIED_FORKS` was in-memory: lost on restart, so follow-up messages in existing Slack threads were dropped until the next @mention. Fixed via `primeSlackRepliedForks` — on consumer spawn, reads the fork for any prior `ns=message, type=end` event and seeds the set.
+- Bigger coupled bug: the discovery cursor never replays already-ack'd `thread.forked` events, so on restart NO consumer was spawned for forks created in prior runs — events for old conversations sat in Spool with nothing reading them. Fixed via `respawnExistingForks` (now inlined into `startForkedChannel`) which calls `spool.listChildren(parent)` at startup and spawns a per-fork consumer for each.
+- Unified `startSlackV2` + `startAgentMailV2` into a single private `startForkedChannel` after a `/simplify` pass on the diff. Net `−56 lines` in `core/spool-loop.ts`.
+- New SpoolClient methods: `listChildren(parent)`, `readEvents(thread, opts)`.
+
+**Doc/memory sweep** (mega commit pending)
+- `CLAUDE.md`: Slack channel bullet still said "Mega-owned" with `/slack/webhook` — pre-fabric stale. Rewrote to match AgentMail (fabric-brokered).
+- Killed `memories/projects/next-up-fabric-followups.md` — all items either done or explicitly skipped (orphaned VPC + AgentMail webhook rotation).
+
 ## 2026-05-11 — Migrated AgentMail + Slack to fabric (broker-of-record)
 
 Cut Mega's own webhook handlers and outbound relays for the two webhook-capable channels. Provider integrations now live in fabric (`https://fabric.delivery`). Mega is a Spool consumer.
