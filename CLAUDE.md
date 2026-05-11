@@ -137,18 +137,39 @@ Mega no longer receives AgentMail webhooks directly. Fabric (`https://fabric.del
 
 Flow:
 1. Email lands at the configured AgentMail inbox.
-2. AgentMail Svix-signs a webhook to `https://fabric.delivery/agentmail/webhook/<connector_id>`.
-3. Fabric verifies the signature, derives the email's `thread_id` via `deriveForkKey`, and publishes `ns=agentmail, type=message` into the forked child thread `<MEGA_AGENTMAIL_PARENT>/<thread_id>`. Fabric creates the child thread as a fork of the parent, which emits a `thread.forked` event on the parent.
+2. AgentMail Svix-signs a webhook to `https://fabric.delivery/agentmail-inbound/webhook/<inbound_connector_id>`.
+3. Fabric verifies the signature against the inbound connector's `svix` credentials slot, derives the email's `thread_id` via `deriveForkKey`, and publishes `ns=agentmail, type=message` into the forked child thread `<MEGA_AGENTMAIL_PARENT>/<thread_id>`. Fabric creates the child thread as a fork of the parent, which emits a `thread.forked` event on the parent.
 4. Mega's `startAgentMailV2(spool, MEGA_AGENTMAIL_PARENT)` tails the parent's discovery cursor (filter `ns=thread, type=forked`) and spawns a per-fork inbound consumer on each child.
 5. The per-fork consumer reads `ns=agentmail, type=message` in lineage mode, invokes Claude with `sessionId = <fork name>`, publishes Claude's response as `ns=message, type=end` back to the same fork.
-6. Fabric's outbound supervisor (with `fork=true` on the matching outbound binding) tails per-fork for `message.end` and calls `POST /v0/inboxes/{inbox}/messages/{reply_to_message_id}/reply`.
+6. The fabric outbound supervisor's tail on the outbound connector (with `fork=true` on its binding) picks up the `message.end` and calls `POST /v0/inboxes/{inbox}/messages/{reply_to_message_id}/reply` using the `api` credentials slot (which bundles `api_key` + `inbox_id`).
 
 #### Setup
-Operator-side (one-time, against fabric):
-1. Create the fabric connector for the AgentMail inbox: `POST https://fabric.delivery/v1/connectors` with `type=agentmail, mode=both, config={api_key, inbox_id}`.
-2. Register the AgentMail webhook against `https://fabric.delivery/agentmail/webhook/<connector_id>`; capture the `whsec_…` secret and `PATCH` the connector config to add it.
-3. Create the Spool parent thread (e.g. `mega/agentmail`) under Mega's client id (`mega@<domain>`); invite fabric's client id (`fabric-prod`) as `writer`.
-4. Create an inbound binding on the fabric connector with `direction=inbound, thread=mega/agentmail, fork=true`. Create an outbound binding on the same connector with `direction=outbound, thread=mega/agentmail, fork=true`.
+Operator-side (one-time, against fabric). The split-connector model means **2 credentials + 2 connectors + 2 bindings** per channel:
+
+1. Create the Svix credentials record (verify-only secret AgentMail signs webhooks with):
+   ```
+   POST /v1/credentials { type: "agentmail-svix", name: "mega-agentmail",
+                         config: { webhook_secret: "whsec_…" } }
+   ```
+2. Create the API credentials record (replies use this; inbox id bundled with the key):
+   ```
+   POST /v1/credentials { type: "agentmail-api", name: "mega-agentmail",
+                         config: { api_key, inbox_id } }
+   ```
+3. Create the inbound connector and the outbound connector, each referencing the matching credential:
+   ```
+   POST /v1/connectors { type: "agentmail-inbound",  config: {},
+                         credentials: [{ slot: "svix", credential_id: <id1> }] }
+   POST /v1/connectors { type: "agentmail-outbound", config: {},
+                         credentials: [{ slot: "api",  credential_id: <id2> }] }
+   ```
+4. Create the AgentMail Svix subscription against `https://fabric.delivery/agentmail-inbound/webhook/<inbound_connector_id>`.
+5. Create the Spool parent thread (e.g. `mega/agentmail`) under Mega's client id (`mega@<domain>`); invite fabric's client id (`fabric-prod`) as `writer`.
+6. Create one binding on each connector — both `fork: true`, both `thread: mega/agentmail`:
+   ```
+   POST /v1/connectors/<inbound_id>/bindings  { thread: "mega/agentmail", fork: true }
+   POST /v1/connectors/<outbound_id>/bindings { thread: "mega/agentmail", fork: true }
+   ```
 
 Mega-side:
 1. Set `MEGA_AGENTMAIL_PARENT=mega/agentmail` in `.env`.
@@ -159,12 +180,12 @@ Mega-side:
 Same shape as AgentMail — Mega doesn't receive Slack webhooks directly. Fabric (`https://fabric.delivery`) handles inbound (signature verify, 🤔 reaction, fork-per-Slack-thread publish) and outbound (`chat.postMessage` + 🤔 cleanup). Mega is a Spool consumer.
 
 Flow:
-1. Slack delivers an Events API webhook to `https://fabric.delivery/slack/webhook/<connector_id>`.
-2. Fabric verifies the `v0=<hex>` signature, handles `url_verification` if present, parses the `event_callback`, fires `reactions.add({channel, ts, name: thinking_face})` fire-and-forget (skipped for bot-authored events to prevent loops), and publishes `ns=slack, type=<event.type>` (app_mention, message, etc.) into the forked child thread `<MEGA_SLACK_PARENT>/<channel>-<thread_ts ?? ts>`.
+1. Slack delivers an Events API webhook to `https://fabric.delivery/slack-inbound/webhook/<inbound_connector_id>`.
+2. Fabric verifies the `v0=<hex>` signature against the inbound connector's `signing` credentials slot, handles `url_verification` if present, parses the `event_callback`, fires `reactions.add({channel, ts, name: thinking_face})` fire-and-forget (uses the `bot` slot — skipped if absent or for bot-authored events to prevent loops), and publishes `ns=slack, type=<event.type>` (app_mention, message, etc.) into the forked child thread `<MEGA_SLACK_PARENT>/<channel>-<thread_ts ?? ts>`.
 3. Mega's `startSlackV2(spool, MEGA_SLACK_PARENT)` tails the parent's discovery cursor (filter `ns=thread, type=forked`). Each new fork spawns a per-fork inbound consumer (filter `ns=slack`, no type filter — discriminates in `shouldRespondSlack`).
 4. The per-fork consumer invokes Claude with `sessionId = <fork name>`. Session continuity gives Claude prior turns; no Slack history fetch.
 5. Claude's response is published as `ns=message, type=end` back to the same fork, with `{channel, thread_ts, ts}` carried through.
-6. Fabric's outbound supervisor tails per-fork for `message.end`, calls `chat.postMessage`, then `reactions.remove` (best-effort).
+6. The fabric outbound supervisor's tail on the outbound connector picks up the `message.end`, calls `chat.postMessage` using the `bot` credentials slot, then `reactions.remove` (best-effort).
 
 `shouldRespondSlack` filter (consumer):
 - `bot_id` / `app_id` / `subtype=bot_message` → skip. Stops the bot from re-invoking on its own replies.
@@ -175,16 +196,39 @@ Flow:
 `thread_ts ?? ts`: top-level @mentions don't carry `thread_ts` (Slack only sets it on replies-in-threads). Consumer falls back to `ts`, so the outbound reply lands in-thread.
 
 #### Setup
-Operator-side (one-time):
-1. Create the fabric Slack connector:
+Operator-side (one-time, all calls send `X-Client-Id: mega@<MEGA_DOMAIN>`). The split-connector model means **2 credentials + 2 connectors + 2 bindings** per channel:
+
+1. Create the signing credentials record (verify-only secret Slack signs webhooks with):
    ```
-   POST https://fabric.delivery/v1/connectors  X-Client-Id: mega@<MEGA_DOMAIN>
-   { type: "slack", mode: "both",
-     config: { signing_secret, bot_token, thinking_emoji: "thinking_face" } }
+   POST /v1/credentials { type: "slack-signing", name: "mega-slack",
+                         config: { signing_secret } }
    ```
-2. Update `slack/manifest.json` `event_subscriptions.request_url` to `https://fabric.delivery/slack/webhook/<connector_id>`. Paste manifest into api.slack.com → app → App Manifest → Save Changes → Install/Reinstall App.
-3. Create the Spool parent thread (e.g. `slack/<bot_user_id>`) under Mega's `X-Client-Id`; invite `fabric-prod` as `writer`.
-4. Create inbound + outbound bindings on the connector with `fork: true` and `thread: <parent>`.
+2. Create the bot credentials record (used by `chat.postMessage`, and optionally by the inbound 🤔 reaction):
+   ```
+   POST /v1/credentials { type: "slack-bot", name: "mega-slack",
+                         config: { bot_token } }
+   ```
+3. Create the inbound connector (signing required, bot optional but supply it so the 🤔 ack works) and the outbound connector:
+   ```
+   POST /v1/connectors { type: "slack-inbound",
+                         config: { thinking_emoji: "thinking_face" },
+                         credentials: [
+                           { slot: "signing", credential_id: <signing_id> },
+                           { slot: "bot",     credential_id: <bot_id> }
+                         ] }
+   POST /v1/connectors { type: "slack-outbound",
+                         config: { thinking_emoji: "thinking_face" },
+                         credentials: [
+                           { slot: "bot", credential_id: <bot_id> }
+                         ] }
+   ```
+4. Update `slack/manifest.json` `event_subscriptions.request_url` to `https://fabric.delivery/slack-inbound/webhook/<inbound_connector_id>`. Paste manifest into api.slack.com → app → App Manifest → Save Changes → Install/Reinstall App.
+5. Create the Spool parent thread (e.g. `slack/<bot_user_id>`) under Mega's `X-Client-Id`; invite `fabric-prod` as `writer`.
+6. Create one binding on each connector — both `fork: true`, both `thread: slack/<bot_user_id>`:
+   ```
+   POST /v1/connectors/<inbound_id>/bindings  { thread: "slack/<bot_user_id>", fork: true }
+   POST /v1/connectors/<outbound_id>/bindings { thread: "slack/<bot_user_id>", fork: true }
+   ```
 
 Mega-side:
 1. Set `MEGA_SLACK_PARENT=slack/<bot_user_id>` in `.env`.
@@ -195,7 +239,7 @@ Haakam's Slack user ID: `U08TMCS2KRT`, DM channel: `D0AS9T5CP4K`. Mega's bot_use
 #### Slack-side notes (carried over from pre-fabric)
 - `C…` channel ids cover both public AND private channels — `message.groups` + `groups:history` must be in the manifest scopes.
 - Slack manifest changes require **Reinstall App** before new event subscriptions take effect; the existing bot token doesn't rotate.
-- Slack delivers @mentions as BOTH `app_mention` and `message.channels` events. Both reach the same fork; Mega's invoke dedup (`.seen_events`) prevents double-firing Claude on the same Slack `event_id`.
+- Slack delivers @mentions as BOTH `app_mention` and `message.channels` events with **different envelope `event_id`s**. Mega's invoke dedup keys Slack events on the inner `(channel, ts)` pair (`slackDedupId` in `core/spool-loop.ts`), which is identical across both deliveries, so Claude only fires once per Slack message.
 
 ### How Linear Webhooks Work
 

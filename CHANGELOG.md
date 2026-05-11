@@ -2,6 +2,39 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-05-11 (session 3) — Fabric split per-direction connector types + credentials primitive
+
+Rewrote fabric to decouple inbound from outbound. Operators want a flexible mix-and-match topology; the v0 `mode: inbound|outbound|both` connectors couldn't express it.
+
+**Schema** (`fabric/migrations/0003_credentials_and_split.sql`)
+- New `credentials` table (per-direction secret blobs, encrypted at rest, unique `(client_id, name)`).
+- New `connector_credentials` junction (`connector_id, slot, credential_id`). `ON DELETE RESTRICT` on credentials — operators can't drop refs that are still wired.
+- Dropped `connectors.mode` and `bindings.direction`. Direction is now encoded by the type name.
+
+**Registry split** (`fabric/src/core/registry.ts`)
+- `InboundConnectorType<C>` / `OutboundConnectorType<C>` are now distinct top-level interfaces; the old `ConnectorType.{inbound?,outbound?}` shape is gone.
+- Each type declares `credentialSlots: { name, credentialType, required }[]`. The API validates supplied refs against the slots at connector-create/patch time (slot exists, required filled, referenced cred's type matches).
+- Handlers receive `ResolvedCredentials` (map keyed by slot name); secrets never travel through `cfg`.
+
+**Type implementations** (`fabric/src/connectors/{slack,agentmail,linear}/`)
+- Five types: `slack-inbound` (slots `signing` + optional `bot`), `slack-outbound` (`bot`), `agentmail-inbound` (`svix`), `agentmail-outbound` (`api`, bundles `api_key`+`inbox_id`), `linear-inbound` (`signing`).
+- Each provider split into `<direction>.ts` + a `shared.ts` for sig-verify/parser helpers.
+
+**API + wire layer**
+- New `/v1/credentials` CRUD. GET is redacted — only `config_keys`. DELETE returns 409 `credential_in_use` when a connector references it.
+- Connector create/patch body adds `credentials: [{ slot, credential_id }]`. PATCH-replaces semantics.
+- Dispatcher: gated on `registry.isInbound(type)`, resolves creds per delivery.
+- Supervisor: `listActiveBindingIdsForConnectorTypes(registry.outboundTypeNames())` replaces the direction-filtered query; creds resolved once at tail spawn and threaded through every `dispatch()`.
+
+**Tests** (216 passing, 17 files)
+- New `credentials-repo.test.ts`. Rewrote all integration fixtures (`apiCreateCredential` + new `apiCreateConnector` shape, no direction on bindings). Stub types renamed `stub-inbound` / `stub-outbound`.
+
+**Mega-side docs + Slack double-fire fix**
+- Setup flow in mega `CLAUDE.md` "How Email Works" + "How Slack Works" updated: 2 credentials + 2 connectors + 2 bindings per channel.
+- Slack manifest `request_url` is now `https://fabric.delivery/slack-inbound/webhook/<inbound_connector_id>`. AgentMail Svix subscription points at `/agentmail-inbound/webhook/<id>`.
+- During prod cutover, a single @mention-in-thread fired Claude twice. Cause: Slack delivers `app_mention` + `message.channels` with distinct envelope `event_id`s, mega's dedup was keyed on those envelope ids, and both events passed `shouldRespondSlack` in a fork already in `SLACK_REPLIED_FORKS`. Fix: new `slackDedupId(ev)` keys on the inner `(channel, ts)` pair, which is identical across the two deliveries (`core/spool-loop.ts` + `core/spool-loop.test.ts`). The CLAUDE.md "Slack-side notes" line claiming dedup catches this was wrong; corrected.
+- Followup tracked in `memories/projects/2026-05-11-fabric-stable-webhook-urls-followup.md`: add an operator-chosen `slug` to inbound connectors so wipe+rewire stops forcing a Slack manifest reinstall.
+
 ## 2026-05-11 (session 2) — Fabric HA + Mega fork-restart durability
 
 Followed up on the fabric cutover. Three fabric/mega changes that unblock prod scaling, fix a silent dedup-collision bug, and make Slack/AgentMail consumers survive a restart cleanly.

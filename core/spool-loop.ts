@@ -294,6 +294,18 @@ async function primeSlackRepliedForks(
   }
 }
 
+/** Slack delivers a single @mention as both an `app_mention` envelope and
+ *  a `message.channels` envelope, each with a distinct top-level event_id.
+ *  Dedup the per-message work by the inner `(channel, ts)` pair, which is
+ *  identical across the two deliveries, so we don't fire Claude twice. */
+export function slackDedupId(ev: SpoolEvent): string {
+  const channel = ev.data.channel as string | undefined;
+  const ts = ev.data.ts as string | undefined;
+  if (channel && ts) return `slack:${channel}:${ts}`;
+  const eventId = ev.data.event_id as string | undefined;
+  return eventId || ev.id || `spool-seq-${ev.seq}`;
+}
+
 function shouldRespondSlack(ev: SpoolEvent, fork: string): boolean {
   const d = ev.data as {
     type?: unknown;
@@ -348,7 +360,7 @@ async function handleSlackInbound(
   const sessionId = `slack-${channel}-${threadTs}`;
 
   const handle = invokeWithHandle({
-    eventId: ev.data.event_id ?? ev.id ?? `spool-seq-${thread}-${ev.seq}`,
+    eventId: slackDedupId(ev),
     sessionId,
     prompt,
     systemPrompt: SLACK_SYSTEM_PROMPT,
