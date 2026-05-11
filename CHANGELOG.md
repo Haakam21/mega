@@ -2,6 +2,35 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-05-11 — AgentMail: WebSocket → webhook + shared HTTP server
+
+Replaced AgentMail's WebSocket inbound (`wss://ws.agentmail.to/v0`) with an HTTPS webhook at `/agentmail/webhook`. AgentMail signs with Svix; the handler verifies HMAC-SHA256 over `${svix-id}.${svix-timestamp}.${body}` keyed by the base64-decoded `whsec_` secret, with a 5-min replay window. Spool dedup id stays as `payload.event_id` so a parallel WebSocket delivery (during migration) and webhook retries all collide on the same id.
+
+Side effect of the migration: AgentMail's WebSocket reconnect loop (failing with `Expected 101 status code` for days) is gone.
+
+Architectural change: introduced `core/http-server.ts` so all webhook channels (AgentMail, Linear, Slack later) share a single Bun.serve on port 8000 with path routes. exe.dev only forwards one public port per VM, so consolidation was a prerequisite. Each channel now exports a `routes(spool)` function that the harness composes.
+
+Bug found and fixed mid-migration: `agentmail/spool-relay.ts::startOutbound` had a single try/catch wrapping the entire `for await` loop, so any per-event failure (e.g. a 404 on a stale `message_id`) tore down the outbound tail until the next harness restart. A synthetic webhook smoke test surfaced this in production logs. Per-event try/catch now logs + advances the cursor; the queue keeps moving.
+
+- `core/http-server.ts` (new, ~45 LoC): shared Bun HTTP server, exact path routing, built-in `/health`.
+- `agentmail/webhook.ts` (new, ~125 LoC): Svix verification + Spool publish. `verifySvixSignature` is exported for unit tests and accepts injectable `secret`/`nowMs` for deterministic testing.
+- `agentmail/webhook.test.ts` (new, 11 cases): good/bad/tampered/missing-headers, timestamp tolerance edges, multi-signature header, non-v1 version, empty secret.
+- `agentmail/spool-relay.ts`: deleted `startInbound` (WebSocket). Kept `startOutbound` + `inboxThread`. Hardened the outbound loop's per-event error handling.
+- `linear/spool-relay.ts`: refactored from owning `Bun.serve` to exporting `routes(spool)` for the shared server. Pure cleanup — same handler, same filter, same dedup.
+- `index.ts`: composes routes from agentmail + linear and calls `startHttpServer` once. AgentMail webhook is gated on `AGENTMAIL_WEBHOOK_SECRET` so the route only appears when configured.
+- `Makefile`: added `agentmail/webhook.test.ts` to `test-unit`.
+- `.env.example`: documented `AGENTMAIL_WEBHOOK_SECRET`.
+- `CLAUDE.md`: rewrote "How Email Works" + "How Channels Work" + project structure + env table.
+
+**Live verification**: registered the webhook with AgentMail, sent a real email from `youthfuljob442@agentmail.to` → `mega1@agentmail.to`. Webhook fired, signature verified, event published to Spool, consumer invoked Claude, reply ("Confirmed — AgentMail webhook path is live and reachable at 2026-05-11") posted back via the outbound relay and landed in the sender inbox.
+
+Tests: **104/104 unit pass** across 11 files (was 93/10). New: `agentmail/webhook.test.ts` (11 cases).
+
+**Follow-ups** (deferred):
+- **Rotate the AgentMail webhook secret.** It surfaced in this session's transcript when registering, so it lives in `./sessions/*.jsonl` and memfs-synced memory. Rotate via `webhooks.delete + create` (or directly at agentmail.to) and update `.env`.
+- **Slack: Socket Mode → Events API.** Next channel in the WebSocket-→webhook migration. Manifest swap + reinstall ceremony, signature verify (`x-slack-signature` over `v0:${ts}:${body}`), URL verification challenge. Once done, `core/websocket.ts` can be deleted.
+- **Apply the same per-event try/catch fix to `slack/spool-relay.ts::startForkOutbound`** — same bug shape, just hasn't hit a 404 yet.
+
 ## 2026-05-10 — Linear → Spool relay (v2), no per-webhook Claude
 
 Linear is the third and final channel to migrate to the Spool relay topology, completing the v2 cutover (AgentMail and Slack already shipped). Unlike the other two, this v2 path drops the Claude consumer entirely.

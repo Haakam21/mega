@@ -54,25 +54,30 @@ mega/
 ├── index.ts           # Entrypoint — starts enabled channels
 ├── core/
 │   ├── env.ts         # Tiny env-var parsing helpers (parsePositiveInt, etc.)
+│   ├── http-server.ts # Shared Bun HTTP server: one port, path-routed across channels
 │   ├── interval.ts    # startInterval(tick, ms) — shared by watchdog + log-rotator
 │   ├── invoke.ts      # Shared: dedup, invoke claude, return response
 │   ├── log-rotator.ts # Periodic harness.log size cap + truncate-in-place
 │   ├── spool.ts       # Spool TS client (used when MEGA_USE_SPOOL=true)
 │   ├── spool-loop.ts  # Spool consumers: AgentMail + Slack v2 (discovery + per-fork)
 │   ├── watchdog.ts    # Periodic claude-process count + warn (runaway leak guard)
-│   └── websocket.ts   # Shared: reconnecting WebSocket client
+│   └── websocket.ts   # Shared reconnecting WebSocket client (still used by slack v1/v2)
 ├── agentmail/
 │   ├── channel.ts     # Direct AgentMail channel (used when MEGA_USE_SPOOL=false)
-│   ├── spool-relay.ts # AgentMail ↔ Spool relay (used when MEGA_USE_SPOOL=true)
+│   ├── spool-relay.ts # Outbound: Spool message.end → AgentMail reply API
+│   ├── webhook.ts     # Inbound: /agentmail/webhook (Svix-signed) → Spool publish
+│   ├── webhook.test.ts # Unit tests for Svix signature verification
 │   └── e2e.test.ts    # End-to-end test (send email, verify reply + session continuity)
 ├── slack/
 │   ├── channel.ts     # Direct Slack channel (used when MEGA_USE_SPOOL=false)
 │   ├── channel.test.ts # Unit tests for buildPrompt
-│   ├── spool-relay.ts # Slack ↔ Spool v2 relay (used when MEGA_USE_SPOOL=true)
+│   ├── spool-relay.ts # Slack ↔ Spool v2 relay (still WebSocket inbound — Socket Mode)
 │   ├── spool-relay.test.ts # Unit tests for slackForkName + intake helpers
 │   └── manifest.json  # Slack app manifest — paste into api.slack.com
 ├── linear/
-│   └── channel.ts     # Linear webhook HTTP server + hygiene audit
+│   ├── channel.ts     # Direct Linear channel (used when MEGA_USE_SPOOL=false)
+│   ├── spool-relay.ts # Inbound: /linear/webhook → Spool linear/hygiene thread
+│   └── spool-relay.test.ts # Unit tests for HMAC + filter + dedup id
 ├── test/
 │   ├── mock-claude.sh  # Mock claude CLI for unit tests
 │   ├── slow-claude.sh  # Slow mock for kill/interrupt tests
@@ -93,12 +98,12 @@ mega/
 6. Token needs repo access with `Pull requests: Read & Write` and `Contents: Read` permissions
 
 ### How Channels Work
-Each channel (email, Slack) follows the same pattern:
-1. Channel connects via `core/websocket.ts` (shared reconnecting WebSocket client)
-2. Incoming events are deduped and passed to `core/invoke.ts`
-3. `invoke.ts` calls `claude --print` with full tool access (`--dangerously-skip-permissions`), session continuity (`--resume`/`--session-id`), and `cwd` set to project root so CLAUDE.md and memories are available
-4. Channel sends the response back via its own API
-5. `bun run index.ts` starts all configured channels in one process
+Each channel maps third-party events into Spool events and back. Transport varies:
+1. **Inbound transport**: AgentMail + Linear arrive via HTTP webhooks; Slack still uses Socket Mode WebSocket. The HTTP receivers share a single `Bun.serve` on port 8000 via `core/http-server.ts` with path routes (`/agentmail/webhook`, `/linear/webhook`).
+2. **Spool publish**: the inbound handler publishes a `ns=<channel>, type=<event>` event with a stable dedup `id` to its channel's Spool thread.
+3. **Consumer**: `core/spool-loop.ts` tails the cursor and invokes Claude via `invokeWithHandle` (or `invoke`). `claude --print` runs with full tool access, session continuity (`--resume`/`--session-id`), and `cwd` set to the project root so CLAUDE.md and memories are available.
+4. **Outbound**: Claude's response is published as `ns=message, type=end` to the same thread; the channel's outbound relay tails it and calls the channel's reply API.
+5. `bun run index.ts` starts all configured channels in one process. exe.dev forwards a single public port (8000) at `https://<vmname>.exe.xyz/`.
 
 ### Process Safety
 Claude invocations can hang, spawn long-lived tool subprocesses, or fail silently. The harness protects against runaway processes in five layers + a watchdog:
@@ -132,18 +137,42 @@ Testing hooks: `MEGA_CLAUDE_BIN` swaps the binary (defaults to `claude`), used b
 | `MEGA_CLAUDE_BIN` | `claude` | path to the Claude binary (test override) |
 | `MEGA_SEEN_EVENTS_PATH` | `<repo>/.seen_events` | dedup file path (test override) |
 | `LINEAR_WEBHOOK_SECRET` | (none) | HMAC-SHA256 signing secret for Linear webhooks |
-| `MEGA_LINEAR_PORT` | `8000` | HTTP server port for Linear webhook receiver |
+| `AGENTMAIL_WEBHOOK_SECRET` | (none) | Svix signing secret (`whsec_…`) for the AgentMail webhook route |
+| `MEGA_HTTP_PORT` | `8000` | Shared HTTP server port (all webhook routes). Single public port — exe.dev forwards 8000 by default. |
+| `MEGA_LINEAR_PORT` | `8000` | HTTP server port for the legacy `MEGA_USE_SPOOL=false` Linear receiver (`linear/channel.ts`). |
 
 All env vars are parsed via `core/env.ts` (`parsePositiveInt` / `parseNonNegativeInt` / `parseString`) — `0` for a positive-int knob is rejected and falls back to the default rather than silently passing through.
 
 ### How Email Works
-1. `agentmail/channel.ts` connects to AgentMail WebSocket and subscribes to the inbox
-2. When an email arrives, it invokes Claude via `core/invoke.ts` using `invokeWithHandle` so the invocation is interruptible
-3. Claude's response is sent as a reply via the AgentMail API
-4. Same email thread = same Claude session (thread ID used as session ID)
-5. Send endpoint: `POST /v0/inboxes/{inbox}/messages/send` with `{to, subject, text}`
-6. Attachments: include `attachments` array with `{content (base64), filename, content_type}`
-7. **Concurrency**: per-thread interrupt-and-merge mirrors Slack — a new email in an already-active thread kills the in-flight invocation and respawns with all messages merged into one prompt. Global cap of `MEGA_AGENTMAIL_MAX_CONCURRENT` (default 4) distinct active threads; excess threads queue up to `MEGA_AGENTMAIL_MAX_QUEUE` (default 100), then drop with a warning. The reply target is always the latest message in the thread.
+
+The AgentMail channel runs in two modes selected by `MEGA_USE_SPOOL`:
+
+- **`MEGA_USE_SPOOL=false`** (legacy): `agentmail/channel.ts` connects to AgentMail's WebSocket and invokes Claude directly per event. Concurrency cap + interrupt-and-merge.
+- **`MEGA_USE_SPOOL=true`** (current): inbound arrives via **HTTP webhook** (Svix-signed) at `/agentmail/webhook`; the handler in `agentmail/webhook.ts` publishes to `agentmail/<inbox_id>` on Spool. The consumer in `core/spool-loop.ts::startAgentMailConsumer` invokes Claude. Outbound replies route through `agentmail/spool-relay.ts::startOutbound` → AgentMail's `/messages/{id}/reply` endpoint.
+
+#### Setup (v2 webhook mode)
+1. Add `AGENTMAIL_API_KEY` and `AGENTMAIL_INBOX_ID` to `.env`.
+2. Register the webhook with AgentMail:
+   ```
+   curl -X POST https://api.agentmail.to/v0/webhooks \
+     -H "Authorization: Bearer $AGENTMAIL_API_KEY" \
+     -H "Content-Type: application/json" \
+     -d '{"url":"https://<MEGA_DOMAIN>/agentmail/webhook","event_types":["message.received","message.received.spam"],"inbox_ids":["<inbox>"],"client_id":"mega-<domain>"}'
+   ```
+3. Copy the response's `secret` (format `whsec_<base64>`) into `.env` as `AGENTMAIL_WEBHOOK_SECRET`.
+4. Restart the harness — the `/agentmail/webhook` route is gated on that secret being set.
+
+#### Webhook details
+- **Signing**: Svix-style. Headers `svix-id`, `svix-timestamp`, `svix-signature`. Verification: HMAC-SHA256 over `${svix-id}.${svix-timestamp}.${body}` keyed by the base64-decoded secret bytes; constant-time compare against each space-delimited `v1,<base64>` in the signature header. 5-minute timestamp tolerance for replay protection. Implemented in `agentmail/webhook.ts::verifySvixSignature`.
+- **Dedup**: spool publish uses `id: payload.event_id` so webhook retries (same `svix-id`) and any parallel WebSocket delivery (if both were active during migration) dedup against each other server-side.
+- **Reply path**: same as before — `POST /v0/inboxes/{inbox}/messages/{message_id}/reply` with `{text}`. Same Spool thread per inbox, same session id per AgentMail thread.
+- **Public URL**: exe.dev's HTTPS proxy forwards `india-desert.exe.xyz/*` to port 8000 by default. All three channels (AgentMail, Slack, Linear) will eventually share that single public port via path routing in `core/http-server.ts`.
+
+#### Outbound loop hardening
+- A bad reply (e.g. 404 on a stale `message_id`) does **not** tear down the outbound tail. `startOutbound` wraps each iteration's `handleOutbound` in a per-event try/catch: failures log + advance the cursor so the queue keeps moving. The consumer is the place to retry, not this relay.
+
+#### Legacy v1 concurrency notes
+- Per-thread interrupt-and-merge: a new email in an already-active thread kills the in-flight invocation and respawns with all messages merged into one prompt. Global cap of `MEGA_AGENTMAIL_MAX_CONCURRENT` (default 4) distinct active threads; excess threads queue up to `MEGA_AGENTMAIL_MAX_QUEUE` (default 100), then drop with a warning. Only applies to the legacy direct path; the spool consumer serializes per-cursor.
 
 ### How Slack Works
 

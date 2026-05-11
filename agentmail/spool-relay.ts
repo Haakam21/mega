@@ -1,18 +1,14 @@
 /**
- * AgentMail ↔ Spool relay. Bidirectional bridge:
- *   inbound  : AgentMail WebSocket → Spool publish (ns=agentmail, type=message)
+ * AgentMail ↔ Spool relay (outbound). Inbound now arrives via webhook
+ * (see `agentmail/webhook.ts`); this file only owns the reply path:
  *   outbound : Spool cursor tail (ns=message, type=end) → AgentMail API send
  *
- * The Mega consumer (core/spool-loop.ts) sits between, reading inbound
- * events and publishing replies. This relay is dumb — no Claude, no
- * routing logic.
+ * The Mega consumer in `core/spool-loop.ts` writes `message.end` events;
+ * this relay tails them and posts replies via the AgentMail messages
+ * API. Single cursor, single tail, single thread per inbox.
  */
 
-import { connectWebSocket } from "../core/websocket";
-import {
-  type SpoolClient,
-  type SpoolEvent,
-} from "../core/spool";
+import { type SpoolClient, type SpoolEvent } from "../core/spool";
 
 const API = "https://api.agentmail.to/v0";
 const apiKey = process.env.AGENTMAIL_API_KEY!;
@@ -21,63 +17,6 @@ const inboxId = process.env.AGENTMAIL_INBOX_ID!;
 /** Spool thread carrying every email + every reply for this inbox. */
 export function inboxThread(): string {
   return `agentmail/${inboxId}`;
-}
-
-/** Subscribe to AgentMail's WebSocket and publish each incoming email
- *  as a `ns=agentmail, type=message` event on the inbox thread. */
-export function startInbound(spool: SpoolClient): void {
-  const thread = inboxThread();
-  console.log(`[agentmail-spool] inbound: ${thread}`);
-
-  connectWebSocket({
-    url: `wss://ws.agentmail.to/v0?api_key=${apiKey}`,
-    label: "agentmail-spool",
-    onOpen: (ws) => {
-      ws.send(
-        JSON.stringify({
-          type: "subscribe",
-          inbox_ids: [inboxId],
-          event_types: ["message.received", "message.received.spam"],
-        })
-      );
-    },
-    onMessage: async (data) => {
-      if (data.type === "subscribed") {
-        console.log("[agentmail-spool] inbound: subscribed");
-        return;
-      }
-      if (
-        data.event_type !== "message.received" &&
-        data.event_type !== "message.received.spam"
-      ) {
-        return;
-      }
-      try {
-        await spool.publish(thread, [
-          {
-            ns: "agentmail",
-            type: "message",
-            // Producer-assigned id provides a hint for downstream dedup;
-            // Spool itself doesn't dedup on it.
-            id: data.event_id,
-            source: `agentmail.relay@${process.env.MEGA_DOMAIN ?? "india-desert.exe.xyz"}`,
-            data: {
-              event_id: data.event_id,
-              inbox_id: inboxId,
-              thread_id: data.message.thread_id,
-              message_id: data.message.message_id,
-              from: data.message.from_,
-              to: data.message.to,
-              subject: data.message.subject,
-              text: data.message.extracted_text || data.message.text || "",
-            },
-          },
-        ]);
-      } catch (e) {
-        console.error("[agentmail-spool] inbound publish failed:", e);
-      }
-    },
-  });
 }
 
 /** Tail the inbox thread for `message.end` events and post each as a
@@ -102,7 +41,18 @@ export async function startOutbound(spool: SpoolClient): Promise<void> {
   (async () => {
     try {
       for await (const ev of spool.tailCursor(cursor.id)) {
-        await handleOutbound(ev);
+        // Per-event try/catch: a single bad reply (e.g. 404 on a stale
+        // message_id) must not tear down the whole outbound loop. Log
+        // and advance so the queue keeps moving; the consumer is the
+        // place to retry, not this relay.
+        try {
+          await handleOutbound(ev);
+        } catch (e) {
+          console.error(
+            `[agentmail-spool] outbound: failed seq=${ev.seq}, advancing anyway:`,
+            e
+          );
+        }
         await spool.ackCursor(cursor.id, ev.seq + 1);
       }
     } catch (e) {

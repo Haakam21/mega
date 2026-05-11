@@ -10,10 +10,9 @@
 
 import { createHash, createHmac, timingSafeEqual } from "crypto";
 import type { SpoolClient } from "../core/spool";
-import { parsePositiveInt } from "../core/env";
+import type { RouteHandler } from "../core/http-server";
 
 const webhookSecret = process.env.LINEAR_WEBHOOK_SECRET!;
-const DEFAULT_PORT = 8000;
 
 /** Single flat thread for now — single-tenant. If Mega ever audits more
  *  than one Linear workspace, key by workspace id. */
@@ -65,79 +64,74 @@ export function deriveDedupId(body: string): string {
   return createHash("sha256").update(body).digest("hex");
 }
 
-export function start(spool: SpoolClient): void {
-  const port = parsePositiveInt("MEGA_LINEAR_PORT", DEFAULT_PORT);
-  const thread = LINEAR_HYGIENE_THREAD;
+async function handleWebhook(
+  req: Request,
+  spool: SpoolClient
+): Promise<Response> {
+  if (req.method !== "POST") {
+    return new Response("Method Not Allowed", { status: 405 });
+  }
 
-  void spool.createThread(thread).catch((e) => {
-    console.error(`[linear-spool] createThread(${thread}) failed:`, e);
-  });
+  const body = await req.text();
+  const signature = req.headers.get("linear-signature") || "";
 
-  Bun.serve({
-    port,
-    async fetch(req) {
-      const url = new URL(req.url);
+  if (!verifySignature(body, signature)) {
+    console.error("[linear-spool] Invalid webhook signature");
+    return new Response("Unauthorized", { status: 401 });
+  }
 
-      if (req.method === "GET" && url.pathname === "/health") {
-        return new Response("ok", { status: 200 });
-      }
+  let payload: any;
+  try {
+    payload = JSON.parse(body);
+  } catch {
+    return new Response("Bad Request", { status: 400 });
+  }
 
-      if (req.method !== "POST" || url.pathname !== "/linear/webhook") {
-        return new Response("Not Found", { status: 404 });
-      }
+  if (!isRelevantEvent(payload)) {
+    const t = payload.type ?? "unknown";
+    const a = payload.action ?? "unknown";
+    console.log(`[linear-spool] Skipping ${a} ${t} (not in scope)`);
+    return new Response("OK", { status: 200 });
+  }
 
-      const body = await req.text();
-      const signature = req.headers.get("linear-signature") || "";
-
-      if (!verifySignature(body, signature)) {
-        console.error("[linear-spool] Invalid webhook signature");
-        return new Response("Unauthorized", { status: 401 });
-      }
-
-      let payload: any;
-      try {
-        payload = JSON.parse(body);
-      } catch {
-        return new Response("Bad Request", { status: 400 });
-      }
-
-      if (!isRelevantEvent(payload)) {
-        const t = payload.type ?? "unknown";
-        const a = payload.action ?? "unknown";
-        console.log(`[linear-spool] Skipping ${a} ${t} (not in scope)`);
-        return new Response("OK", { status: 200 });
-      }
-
-      const identifier =
-        payload.data?.identifier ??
-        payload.data?.name ??
-        payload.data?.id ??
-        "unknown";
-      const stateName = payload.data?.state?.name ?? "unknown";
-      console.log(
-        `[linear-spool] ${payload.action} ${payload.type} ${identifier} → ${stateName}`
-      );
-
-      try {
-        await spool.publish(thread, [
-          {
-            ns: "linear",
-            type: "webhook",
-            id: deriveDedupId(body),
-            source: `linear.relay@${process.env.MEGA_DOMAIN ?? "india-desert.exe.xyz"}`,
-            data: payload,
-          },
-        ]);
-      } catch (e) {
-        console.error("[linear-spool] publish failed:", e);
-        return new Response("Internal Error", { status: 500 });
-      }
-
-      return new Response("OK", { status: 200 });
-    },
-  });
-
+  const identifier =
+    payload.data?.identifier ??
+    payload.data?.name ??
+    payload.data?.id ??
+    "unknown";
+  const stateName = payload.data?.state?.name ?? "unknown";
   console.log(
-    `[linear-spool] Webhook server listening on port ${port}, thread=${thread}`
+    `[linear-spool] ${payload.action} ${payload.type} ${identifier} → ${stateName}`
   );
+
+  try {
+    await spool.publish(LINEAR_HYGIENE_THREAD, [
+      {
+        ns: "linear",
+        type: "webhook",
+        id: deriveDedupId(body),
+        source: `linear.relay@${process.env.MEGA_DOMAIN ?? "india-desert.exe.xyz"}`,
+        data: payload,
+      },
+    ]);
+  } catch (e) {
+    console.error("[linear-spool] publish failed:", e);
+    return new Response("Internal Error", { status: 500 });
+  }
+
+  return new Response("OK", { status: 200 });
+}
+
+/** Side effect: kicks off thread creation (idempotent on Spool). Returns
+ *  the route map for the shared HTTP server to register. */
+export function routes(spool: SpoolClient): Record<string, RouteHandler> {
+  void spool.createThread(LINEAR_HYGIENE_THREAD).catch((e) => {
+    console.error(
+      `[linear-spool] createThread(${LINEAR_HYGIENE_THREAD}) failed:`,
+      e
+    );
+  });
+  return {
+    "/linear/webhook": (req) => handleWebhook(req, spool),
+  };
 }

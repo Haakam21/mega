@@ -7,14 +7,15 @@ import { SpoolClient } from "./core/spool";
 import { startAgentMailConsumer, startSlackV2 } from "./core/spool-loop";
 import {
   inboxThread as agentmailInboxThread,
-  startInbound as startAgentMailInbound,
   startOutbound as startAgentMailOutbound,
 } from "./agentmail/spool-relay";
+import { routes as agentmailWebhookRoutes } from "./agentmail/webhook";
 import {
   slackThread as slackSpoolThread,
   startInbound as startSlackInbound,
 } from "./slack/spool-relay";
-import { start as startLinearSpool } from "./linear/spool-relay";
+import { routes as linearWebhookRoutes } from "./linear/spool-relay";
+import { startHttpServer, type RouteHandler } from "./core/http-server";
 
 console.log("Mega agent harness starting...");
 
@@ -32,8 +33,14 @@ if (useSpool) {
   const spool = new SpoolClient(spoolUrl, `mega@${domain}`);
   console.log(`[mega] spool=${spoolUrl} as mega@${domain}`);
 
-  if (process.env.AGENTMAIL_API_KEY && process.env.AGENTMAIL_INBOX_ID) {
-    startAgentMailInbound(spool);
+  const httpRoutes: Record<string, RouteHandler> = {};
+
+  if (
+    process.env.AGENTMAIL_API_KEY &&
+    process.env.AGENTMAIL_INBOX_ID &&
+    process.env.AGENTMAIL_WEBHOOK_SECRET
+  ) {
+    Object.assign(httpRoutes, agentmailWebhookRoutes(spool));
     void startAgentMailOutbound(spool);
     void startAgentMailConsumer(
       spool,
@@ -53,8 +60,12 @@ if (useSpool) {
   }
 
   if (process.env.LINEAR_WEBHOOK_SECRET) {
-    startLinearSpool(spool);
+    Object.assign(httpRoutes, linearWebhookRoutes(spool));
     channels.push("linear-spool");
+  }
+
+  if (Object.keys(httpRoutes).length > 0) {
+    startHttpServer(httpRoutes);
   }
 } else {
   if (process.env.AGENTMAIL_API_KEY && process.env.AGENTMAIL_INBOX_ID) {
