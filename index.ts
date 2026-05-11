@@ -1,12 +1,7 @@
 import { startWatchdog } from "./core/watchdog";
 import { startLogRotator } from "./core/log-rotator";
 import { SpoolClient } from "./core/spool";
-import { startAgentMailConsumer, startSlackV2 } from "./core/spool-loop";
-import {
-  inboxThread as agentmailInboxThread,
-  startOutbound as startAgentMailOutbound,
-} from "./agentmail/spool-relay";
-import { routes as agentmailWebhookRoutes } from "./agentmail/webhook";
+import { startAgentMailV2, startSlackV2 } from "./core/spool-loop";
 import { slackThread as slackSpoolThread } from "./slack/spool-relay";
 import { routes as slackWebhookRoutes } from "./slack/webhook";
 import { routes as linearWebhookRoutes } from "./linear/spool-relay";
@@ -23,18 +18,15 @@ console.log(`[mega] spool=${spoolUrl} as mega@${domain}`);
 
 const httpRoutes: Record<string, RouteHandler> = {};
 
-if (
-  process.env.AGENTMAIL_API_KEY &&
-  process.env.AGENTMAIL_INBOX_ID &&
-  process.env.AGENTMAIL_WEBHOOK_SECRET
-) {
-  Object.assign(httpRoutes, agentmailWebhookRoutes(spool));
-  void startAgentMailOutbound(spool);
-  void startAgentMailConsumer(
-    spool,
-    agentmailInboxThread(),
-    "mega-agentmail"
-  );
+// AgentMail is now brokered by fabric. Mega doesn't receive AgentMail
+// webhooks directly anymore — fabric does, and publishes per-email-thread
+// fork events into MEGA_AGENTMAIL_PARENT. Mega's consumer tails that
+// parent's thread.forked events and spawns one Claude session per fork.
+// Outbound `message.end` events fabric tails and dispatches to AgentMail's
+// reply API.
+const agentmailParent = process.env.MEGA_AGENTMAIL_PARENT;
+if (agentmailParent) {
+  void startAgentMailV2(spool, agentmailParent);
   channels.push("agentmail");
 }
 

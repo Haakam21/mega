@@ -36,11 +36,11 @@ This repo is a portable agent image. Clone it, run `make setup`, get a running d
 
 - **Claude Code** is the agent — all reasoning and action
 - **memfs** provides shared memory across all instances
-- **Channels** are independently optional; at least one must be configured in `.env`. Each runs only if its env vars are set. All three deliver inbound events via HTTPS webhooks to the shared HTTP server on port 8000.
-    - **AgentMail** (`AGENTMAIL_API_KEY`, `AGENTMAIL_INBOX_ID`, `AGENTMAIL_WEBHOOK_SECRET`) — Svix-signed webhook at `/agentmail/webhook`
-    - **Slack** (`SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`) — Slack-signed Events API webhook at `/slack/webhook`
-    - **Linear** (`LINEAR_WEBHOOK_SECRET`) — Linear HMAC webhook at `/linear/webhook`; relevant events logged to the `linear/hygiene` Spool thread for later audit
-- **Spool** (`MEGA_SPOOL_URL`, default `https://spool.computer`) — the event bus. Every inbound webhook publishes into a Spool thread; Mega's consumer loops in `core/spool-loop.ts` tail per-conversation cursors and invoke Claude. Slack uses a per-Slack-thread fork topology (root `slack/<bot>` + fork `slack/<bot>/<channel>/<ts>`); AgentMail uses a single thread per inbox; Linear writes to a flat `linear/hygiene` thread.
+- **Channels** are independently optional; at least one must be configured in `.env`.
+    - **AgentMail** — brokered by [fabric](https://github.com/Haakam21/fabric). Mega no longer owns the AgentMail webhook or reply path. Fabric receives the Svix webhook, forks per-email-thread, publishes into the `MEGA_AGENTMAIL_PARENT` Spool thread; Mega's `startAgentMailV2` consumer tails the discovery cursor and spawns one Claude session per fork. Outbound `message.end` events fabric tails and dispatches to AgentMail's reply API.
+    - **Slack** (`SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`) — Slack-signed Events API webhook at `/slack/webhook`. Mega still owns Slack inbound + outbound (per-thread fork topology, root `slack/<bot>` + fork `slack/<bot>/<channel>/<ts>`).
+    - **Linear** (`LINEAR_WEBHOOK_SECRET`) — Linear HMAC webhook at `/linear/webhook`; relevant events logged to the `linear/hygiene` Spool thread for later audit.
+- **Spool** (`MEGA_SPOOL_URL`, default `https://spool.computer`) — the event bus. Mega's consumer loops in `core/spool-loop.ts` tail per-conversation cursors and invoke Claude. AgentMail + Slack both use a per-conversation fork topology: a parent thread carries `thread.forked` events; one Claude session is bound to each fork. Linear writes to a flat `linear/hygiene` thread.
 - **GitHub CLI (`gh`)** enables code review on GitHub PRs
 - **Bun** is the runtime — TypeScript, WebSocket, fetch, and subprocess all built-in
 - **No runtime dependencies beyond bun, jq, gh, and claude**
@@ -61,11 +61,6 @@ mega/
 │   ├── spool.ts       # Spool TS client
 │   ├── spool-loop.ts  # Spool consumers: AgentMail + Slack discovery + per-fork
 │   └── watchdog.ts    # Periodic claude-process count + warn (runaway leak guard)
-├── agentmail/
-│   ├── spool-relay.ts # Outbound: Spool message.end → AgentMail reply API
-│   ├── webhook.ts     # Inbound: /agentmail/webhook (Svix-signed) → Spool publish
-│   ├── webhook.test.ts # Unit tests for Svix signature verification
-│   └── e2e.test.ts    # End-to-end test (send email, verify reply + session continuity)
 ├── slack/
 │   ├── spool-relay.ts # Outbound: Spool message.end → chat.postMessage. Shared handleSlackEvent intake.
 │   ├── spool-relay.test.ts # Unit tests for slackForkName + intake helpers
@@ -95,11 +90,12 @@ mega/
 6. Token needs repo access with `Pull requests: Read & Write` and `Contents: Read` permissions
 
 ### How Channels Work
-Each channel maps third-party events into Spool events and back. All three follow the same shape:
-1. **Inbound**: signed HTTPS POST to a path route on the shared `core/http-server.ts` (`/agentmail/webhook`, `/slack/webhook`, `/linear/webhook`). Each handler verifies its provider's signature, then publishes a `ns=<channel>, type=<event>` event with a stable dedup `id` to its channel's Spool thread.
-2. **Consumer**: `core/spool-loop.ts` tails the cursor and invokes Claude via `invokeWithHandle` (or `invoke`). `claude --print` runs with full tool access, session continuity (`--resume`/`--session-id`), and `cwd` set to the project root so CLAUDE.md and memories are available. (Linear has no consumer — its thread is a passive audit log.)
-3. **Outbound**: Claude's response is published as `ns=message, type=end` to the same thread; the channel's outbound relay tails it and calls the channel's reply API. Per-event try/catch around each handler so one bad delivery never tears down the tail.
-4. `bun run index.ts` starts all configured channels in one process. exe.dev forwards a single public port (8000) at `https://<vmname>.exe.xyz/`.
+
+- **AgentMail**: brokered by fabric (no inbound/outbound code in Mega). Mega's `startAgentMailV2` tails a discovery cursor on `MEGA_AGENTMAIL_PARENT` for `thread.forked` events; per fork it spins a consumer that reads `ns=agentmail, type=message` and invokes Claude with `sessionId = fork name`. Claude's reply is published as `ns=message, type=end` to the same fork; fabric's outbound supervisor tails and calls AgentMail's reply API.
+- **Slack**: Mega-owned. Signed Events API webhook at `/slack/webhook`; per-Slack-thread fork topology built by `slack/spool-relay.ts::handleSlackEvent`. `startSlackV2` consumer tails the discovery cursor + per-fork consumers (same shape as AgentMail). Outbound `message.end` events are tailed by Mega's `startForkOutbound` and posted via `chat.postMessage`.
+- **Linear**: Mega-owned, inbound-only. Signed webhook at `/linear/webhook`; events filtered to relevant types and published to `linear/hygiene` as a passive audit log (no consumer).
+
+`bun run index.ts` starts the enabled channels. exe.dev forwards a single public port (8000) at `https://<vmname>.exe.xyz/`. Per-event try/catch around each handler so one bad delivery never tears down the tail.
 
 ### Process Safety
 Claude invocations can hang, spawn long-lived tool subprocesses, or fail silently. The harness protects against runaway processes in five layers + a watchdog:
@@ -130,34 +126,34 @@ Testing hooks: `MEGA_CLAUDE_BIN` swaps the binary (defaults to `claude`), used b
 | `MEGA_CLAUDE_BIN` | `claude` | path to the Claude binary (test override) |
 | `MEGA_SEEN_EVENTS_PATH` | `<repo>/.seen_events` | dedup file path (test override) |
 | `LINEAR_WEBHOOK_SECRET` | (none) | HMAC-SHA256 signing secret for Linear webhooks |
-| `AGENTMAIL_WEBHOOK_SECRET` | (none) | Svix signing secret (`whsec_…`) for the AgentMail webhook route |
+| `MEGA_AGENTMAIL_PARENT` | (none) | Spool parent thread name that fabric publishes AgentMail forks into. Gates `startAgentMailV2`. |
 | `SLACK_SIGNING_SECRET` | (none) | Slack app's Signing Secret. Gates the Events API webhook route at `/slack/webhook`. |
-| `MEGA_HTTP_PORT` | `8000` | Shared HTTP server port (all webhook routes). Single public port — exe.dev forwards 8000 by default. |
+| `MEGA_HTTP_PORT` | `8000` | Shared HTTP server port (Slack + Linear webhook routes). Single public port — exe.dev forwards 8000 by default. |
 
 All env vars are parsed via `core/env.ts` (`parsePositiveInt` / `parseNonNegativeInt` / `parseString`) — `0` for a positive-int knob is rejected and falls back to the default rather than silently passing through.
 
-### How Email Works
+### How Email Works (fabric-brokered)
 
-Inbound arrives via Svix-signed HTTPS webhook at `/agentmail/webhook` (`agentmail/webhook.ts`). The handler verifies the signature, then publishes a `ns=agentmail, type=message` event to the `agentmail/<inbox_id>` Spool thread. The consumer in `core/spool-loop.ts::startAgentMailConsumer` tails the cursor and invokes Claude. Outbound replies route through `agentmail/spool-relay.ts::startOutbound` → AgentMail's `/messages/{id}/reply` endpoint.
+Mega no longer receives AgentMail webhooks directly. Fabric (`https://fabric.delivery`) owns the inbound webhook + outbound reply path; Mega is a Spool consumer.
+
+Flow:
+1. Email lands at the configured AgentMail inbox.
+2. AgentMail Svix-signs a webhook to `https://fabric.delivery/agentmail/webhook/<connector_id>`.
+3. Fabric verifies the signature, derives the email's `thread_id` via `deriveForkKey`, and publishes `ns=agentmail, type=message` into the forked child thread `<MEGA_AGENTMAIL_PARENT>/<thread_id>`. Fabric creates the child thread as a fork of the parent, which emits a `thread.forked` event on the parent.
+4. Mega's `startAgentMailV2(spool, MEGA_AGENTMAIL_PARENT)` tails the parent's discovery cursor (filter `ns=thread, type=forked`) and spawns a per-fork inbound consumer on each child.
+5. The per-fork consumer reads `ns=agentmail, type=message` in lineage mode, invokes Claude with `sessionId = <fork name>`, publishes Claude's response as `ns=message, type=end` back to the same fork.
+6. Fabric's outbound supervisor (with `fork=true` on the matching outbound binding) tails per-fork for `message.end` and calls `POST /v0/inboxes/{inbox}/messages/{reply_to_message_id}/reply`.
 
 #### Setup
-1. Add `AGENTMAIL_API_KEY` and `AGENTMAIL_INBOX_ID` to `.env`.
-2. Register the webhook with AgentMail:
-   ```
-   curl -X POST https://api.agentmail.to/v0/webhooks \
-     -H "Authorization: Bearer $AGENTMAIL_API_KEY" \
-     -H "Content-Type: application/json" \
-     -d '{"url":"https://<MEGA_DOMAIN>/agentmail/webhook","event_types":["message.received","message.received.spam"],"inbox_ids":["<inbox>"],"client_id":"mega-<domain>"}'
-   ```
-3. Copy the response's `secret` (format `whsec_<base64>`) into `.env` as `AGENTMAIL_WEBHOOK_SECRET`.
-4. Restart the harness — the `/agentmail/webhook` route is gated on that secret being set.
+Operator-side (one-time, against fabric):
+1. Create the fabric connector for the AgentMail inbox: `POST https://fabric.delivery/v1/connectors` with `type=agentmail, mode=both, config={api_key, inbox_id}`.
+2. Register the AgentMail webhook against `https://fabric.delivery/agentmail/webhook/<connector_id>`; capture the `whsec_…` secret and `PATCH` the connector config to add it.
+3. Create the Spool parent thread (e.g. `mega/agentmail`) under Mega's client id (`mega@<domain>`); invite fabric's client id (`fabric-prod`) as `writer`.
+4. Create an inbound binding on the fabric connector with `direction=inbound, thread=mega/agentmail, fork=true`. Create an outbound binding on the same connector with `direction=outbound, thread=mega/agentmail, fork=true`.
 
-#### Webhook details
-- **Signing**: Svix-style. Headers `svix-id`, `svix-timestamp`, `svix-signature`. Verification: HMAC-SHA256 over `${svix-id}.${svix-timestamp}.${body}` keyed by the base64-decoded secret bytes; constant-time compare against each space-delimited `v1,<base64>` in the signature header. 5-minute timestamp tolerance for replay protection. Implemented in `agentmail/webhook.ts::verifySvixSignature`.
-- **Dedup**: spool publish uses `id: payload.event_id` so webhook retries dedup against each other server-side.
-- **Reply path**: `POST /v0/inboxes/{inbox}/messages/{message_id}/reply` with `{text}`. One Spool thread per inbox, one Claude session per AgentMail thread.
-- **Outbound resilience**: `startOutbound` wraps each iteration's `handleOutbound` in a per-event try/catch — a stale `message_id` (404) or other API error logs + advances the cursor instead of tearing down the tail.
-- **Public URL**: exe.dev's HTTPS proxy forwards `<MEGA_DOMAIN>/*` to port 8000 by default; all three channels share that single public port via path routing in `core/http-server.ts`.
+Mega-side:
+1. Set `MEGA_AGENTMAIL_PARENT=mega/agentmail` in `.env`.
+2. Restart the harness; `startAgentMailV2` initializes the discovery cursor and waits for forks.
 
 ### How Slack Works
 

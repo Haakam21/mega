@@ -6,3 +6,5 @@
 .slack-images/
 sessions
 memories
+fabric
+.claude/scheduled_tasks.lock

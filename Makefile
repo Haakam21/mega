@@ -11,7 +11,7 @@ setup: setup-deps setup-env setup-sessions setup-memfs setup-github
 	@echo ""
 	@echo "Agent setup complete."
 	@. ./.env && \
-	[ -n "$$AGENTMAIL_INBOX_ID" ] && echo "AgentMail inbox: $$AGENTMAIL_INBOX_ID" || echo "AgentMail: disabled"; \
+	[ -n "$$MEGA_AGENTMAIL_PARENT" ] && echo "AgentMail (via fabric): $$MEGA_AGENTMAIL_PARENT" || echo "AgentMail: disabled"; \
 	[ -n "$$SLACK_BOT_TOKEN" ] && echo "Slack: enabled" || echo "Slack: disabled"
 	@echo "Run 'make start' to start the agent."
 
@@ -69,13 +69,13 @@ setup-env:
 		exit 1; \
 	fi; \
 	agentmail_set=""; slack_set=""; \
-	[ -n "$$AGENTMAIL_API_KEY" ] && [ -n "$$AGENTMAIL_INBOX_ID" ] && agentmail_set=1; \
-	[ -n "$$SLACK_BOT_TOKEN" ] && [ -n "$$SLACK_APP_TOKEN" ] && slack_set=1; \
+	[ -n "$$MEGA_AGENTMAIL_PARENT" ] && agentmail_set=1; \
+	[ -n "$$SLACK_BOT_TOKEN" ] && [ -n "$$SLACK_SIGNING_SECRET" ] && slack_set=1; \
 	if [ -z "$$agentmail_set" ] && [ -z "$$slack_set" ]; then \
-		echo "Error: at least one channel must be configured in .env (AgentMail or Slack)."; \
+		echo "Error: at least one channel must be configured in .env (AgentMail via fabric or Slack)."; \
 		exit 1; \
 	fi; \
-	[ -n "$$agentmail_set" ] && am="enabled" || am="disabled"; \
+	[ -n "$$agentmail_set" ] && am="enabled (fabric-brokered)" || am="disabled"; \
 	[ -n "$$slack_set" ] && sl="enabled" || sl="disabled"; \
 	echo "Required env OK. Channels — agentmail: $$am, slack: $$sl"
 
@@ -135,7 +135,7 @@ status:
 	@echo "=== Agent Status ==="
 	@if [ -f .env ]; then \
 		. ./.env; \
-		[ -n "$$AGENTMAIL_INBOX_ID" ] && echo "AgentMail inbox: $$AGENTMAIL_INBOX_ID" || echo "AgentMail: disabled"; \
+		[ -n "$$MEGA_AGENTMAIL_PARENT" ] && echo "AgentMail (via fabric): $$MEGA_AGENTMAIL_PARENT" || echo "AgentMail: disabled"; \
 		[ -n "$$SLACK_BOT_TOKEN" ] && echo "Slack: enabled" || echo "Slack: disabled"; \
 	else \
 		echo "No .env file."; \
@@ -151,8 +151,11 @@ test: test-unit test-e2e
 
 # Unit tests only
 test-unit:
-	@bun test core/env.test.ts core/interval.test.ts core/invoke.test.ts core/log-rotator.test.ts core/watchdog.test.ts slack/spool-relay.test.ts slack/webhook.test.ts agentmail/webhook.test.ts linear/spool-relay.test.ts
+	@bun test core/env.test.ts core/interval.test.ts core/invoke.test.ts core/log-rotator.test.ts core/watchdog.test.ts slack/spool-relay.test.ts slack/webhook.test.ts linear/spool-relay.test.ts
 
-# E2E tests (requires harness running + .env configured)
+# E2E tests
+# AgentMail's E2E moved to fabric (Mega no longer owns the inbound webhook).
+# Slack/Linear E2E aren't checked in. Left as a placeholder so `make test`
+# still works.
 test-e2e:
-	@bun test agentmail/e2e.test.ts --timeout 130000
+	@echo "(no mega-side e2e tests after the fabric migration)"
