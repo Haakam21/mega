@@ -10,10 +10,7 @@ import {
   startOutbound as startAgentMailOutbound,
 } from "./agentmail/spool-relay";
 import { routes as agentmailWebhookRoutes } from "./agentmail/webhook";
-import {
-  slackThread as slackSpoolThread,
-  startInbound as startSlackInbound,
-} from "./slack/spool-relay";
+import { slackThread as slackSpoolThread } from "./slack/spool-relay";
 import { routes as slackWebhookRoutes } from "./slack/webhook";
 import { routes as linearWebhookRoutes } from "./linear/spool-relay";
 import { startHttpServer, type RouteHandler } from "./core/http-server";
@@ -51,25 +48,16 @@ if (useSpool) {
     channels.push("agentmail-spool");
   }
 
-  if (process.env.SLACK_BOT_TOKEN) {
-    // Slack inbound can arrive via either Socket Mode (legacy) or the
-    // Events API webhook (current). Both wire to the same
-    // `handleSlackEvent`, so we let env vars decide which is live:
-    //   - SLACK_APP_TOKEN     → Socket Mode WebSocket
-    //   - SLACK_SIGNING_SECRET → Events API webhook on /slack/webhook
-    // In practice only one of the two transports is configured on the
-    // Slack app at a time (Socket Mode and Events API delivery are
-    // mutually exclusive), so the unused transport is just a no-op.
+  if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_SIGNING_SECRET) {
+    // Slack inbound arrives via the Events API webhook at /slack/webhook.
+    // The bot token still authorizes outbound chat.postMessage + reactions
+    // + conversations.replies; the signing secret authenticates incoming
+    // deliveries.
     void (async () => {
       const parent = await slackSpoolThread();
-      if (process.env.SLACK_APP_TOKEN) {
-        await startSlackInbound(spool);
-      }
       await startSlackV2(spool, parent);
     })();
-    if (process.env.SLACK_SIGNING_SECRET) {
-      Object.assign(httpRoutes, slackWebhookRoutes(spool));
-    }
+    Object.assign(httpRoutes, slackWebhookRoutes(spool));
     channels.push("slack-spool");
   }
 

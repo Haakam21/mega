@@ -1,12 +1,14 @@
 /**
- * Slack ↔ Spool relay. Bidirectional bridge:
- *   inbound  : Slack Socket Mode WebSocket → fork `slack/<bot>` per Slack
- *              thread, then publish `ns=slack, type=message` into the fork.
+ * Slack ↔ Spool relay. Outbound + shared intake:
+ *   inbound  : `handleSlackEvent` is called from `slack/webhook.ts` after
+ *              an Events API delivery. Applies the type/author/subtype
+ *              filter, then forks the per-Slack-thread Spool thread and
+ *              publishes `ns=slack, type=message`.
  *   outbound : Spool cursor tail per fork (ns=message, type=end) →
  *              Slack chat.postMessage. Per-fork outbound consumers are
  *              spawned by the discovery loop in `core/spool-loop.ts`.
  *
- * Thread topology (v2): root `slack/<bot_user_id>` only carries
+ * Thread topology: root `slack/<bot_user_id>` only carries
  * `thread.forked` audit events. Each Slack thread gets its own fork
  * `slack/<bot>/<channel>/<thread_ts>` carrying that conversation's
  * inbound + outbound events. The consumer (`startSlackV2` in spool-loop)
@@ -14,11 +16,9 @@
  * forks appear.
  */
 
-import { connectWebSocket } from "../core/websocket";
 import { type SpoolClient, type SpoolEvent } from "../core/spool";
 
 const botToken = process.env.SLACK_BOT_TOKEN!;
-const appToken = process.env.SLACK_APP_TOKEN!;
 
 const THINKING_EMOJI = "thinking_face";
 
@@ -67,49 +67,9 @@ export function slackForkName(
   return `${parent}/${channel}/${threadTs}`;
 }
 
-export async function startInbound(spool: SpoolClient): Promise<void> {
-  const myId = await getBotUserId();
-  const thread = await slackThread();
-  console.log(`[slack-spool] inbound: ${thread}`);
-
-  connectWebSocket({
-    url: async () => {
-      const res = await fetch("https://slack.com/api/apps.connections.open", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${appToken}` },
-      });
-      const data = (await res.json()) as any;
-      if (!data.ok) {
-        throw new Error(`apps.connections.open failed: ${data.error}`);
-      }
-      return data.url;
-    },
-    label: "slack-spool",
-    onOpen: () => {
-      console.log("[slack-spool] inbound: socket mode connected");
-    },
-    onMessage: (data, ws) => {
-      // Slack requires envelope ack within 3s, even if we don't act on it.
-      if (data.envelope_id) {
-        ws.send(JSON.stringify({ envelope_id: data.envelope_id }));
-      }
-      if (data.type === "hello") {
-        console.log("[slack-spool] inbound: ready");
-        return;
-      }
-      if (data.type !== "events_api") return;
-      const evt = data.payload?.event;
-      if (!evt) return;
-      void handleSlackEvent(spool, evt, data.envelope_id);
-    },
-  });
-}
-
-/** Shared inbound intake — called from both the Socket Mode WebSocket
- *  handler and the Events API webhook handler. Applies the type/author/
- *  subtype filter, then delegates to `publishInbound`. The transports
- *  differ only in how they respond to Slack (envelope ack for Socket
- *  Mode, HTTP 200 for webhook), which stays in the transport handler. */
+/** Inbound intake — called from `slack/webhook.ts` after an Events API
+ *  delivery is signature-verified. Applies the type/author/subtype
+ *  filter, then delegates to `publishInbound`. */
 export async function handleSlackEvent(
   spool: SpoolClient,
   evt: any,

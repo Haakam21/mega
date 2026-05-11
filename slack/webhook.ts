@@ -92,11 +92,15 @@ async function handleWebhook(
   }
 
   if (payload.type === "event_callback") {
+    const evt = payload.event;
+    console.log(
+      `[slack-webhook] ${evt?.type ?? "?"} from ${evt?.user ?? "?"} in ${evt?.channel ?? "?"}`
+    );
     // Slack's 3-second budget for the response. Dispatch the actual
     // work without awaiting so Spool/Slack-API latencies don't put us
     // over and trigger retries (which we'd dedup, but they're still
     // wasteful).
-    void handleSlackEvent(spool, payload.event, payload.event_id);
+    void handleSlackEvent(spool, evt, payload.event_id);
     return new Response("OK", { status: 200 });
   }
 

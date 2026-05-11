@@ -37,9 +37,9 @@ This repo is a portable agent image. Clone it, run `make setup`, get a running d
 - **Claude Code** is the agent — all reasoning and action
 - **memfs** provides shared memory across all instances
 - **Channels** are independently optional; at least one must be configured in `.env`. Each runs only if its env vars are set.
-    - **AgentMail** (`AGENTMAIL_API_KEY`, `AGENTMAIL_INBOX_ID`) — pushes email events in real-time via WebSocket
-    - **Slack** (`SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`) — pushes DM/mention events in real-time via Socket Mode
-    - **Linear** (`LINEAR_WEBHOOK_SECRET`) — receives Linear webhook POSTs via HTTP server, runs hygiene audits on issues/projects
+    - **AgentMail** (`AGENTMAIL_API_KEY`, `AGENTMAIL_INBOX_ID`, `AGENTMAIL_WEBHOOK_SECRET`) — receives email events via Svix-signed HTTPS webhook at `/agentmail/webhook`
+    - **Slack** (`SLACK_BOT_TOKEN`, `SLACK_SIGNING_SECRET`) — receives DM/mention events via Slack-signed HTTPS webhook at `/slack/webhook`
+    - **Linear** (`LINEAR_WEBHOOK_SECRET`) — receives Linear webhook POSTs at `/linear/webhook`, logs to the `linear/hygiene` Spool thread for later audit
 - **Spool** (`MEGA_USE_SPOOL=true`, `MEGA_SPOOL_URL`) — when enabled, all channels run as bidirectional relays into Spool (https://spool.computer). Mega's consumer loops in `core/spool-loop.ts` tail per-conversation cursors and invoke Claude. Slack uses a per-Slack-thread fork topology (root `slack/<bot>` + fork `slack/<bot>/<channel>/<ts>`); AgentMail uses a single thread per inbox.
 - **GitHub CLI (`gh`)** enables code review on GitHub PRs
 - **Bun** is the runtime — TypeScript, WebSocket, fetch, and subprocess all built-in
@@ -71,7 +71,7 @@ mega/
 ├── slack/
 │   ├── channel.ts     # Direct Slack channel (used when MEGA_USE_SPOOL=false)
 │   ├── channel.test.ts # Unit tests for buildPrompt
-│   ├── spool-relay.ts # Outbound: Spool message.end → chat.postMessage. Shared handleSlackEvent intake. Legacy Socket Mode inbound still resident; deletes after Events API cutover.
+│   ├── spool-relay.ts # Outbound: Spool message.end → chat.postMessage. Shared handleSlackEvent intake.
 │   ├── spool-relay.test.ts # Unit tests for slackForkName + intake helpers
 │   ├── webhook.ts     # Inbound: /slack/webhook (Slack-signed) → handleSlackEvent
 │   ├── webhook.test.ts # Unit tests for verifySlackSignature
@@ -181,19 +181,14 @@ The AgentMail channel runs in two modes selected by `MEGA_USE_SPOOL`:
 
 The Slack channel runs in two modes selected by `MEGA_USE_SPOOL`:
 
-- **`MEGA_USE_SPOOL=false`** (legacy): `slack/channel.ts` connects via Socket Mode and invokes Claude directly per event. One Claude session per Slack thread keyed `slack-${channel}-${thread_ts}`.
-- **`MEGA_USE_SPOOL=true`** (current): `slack/spool-relay.ts` is a Spool bridge — Slack events publish into a Spool fork per Slack thread, the Mega consumer (`core/spool-loop.ts::startSlackV2`) tails them and invokes Claude, and replies route back through the same fork to Slack.
+- **`MEGA_USE_SPOOL=false`** (legacy): `slack/channel.ts` connects via Socket Mode WebSocket and invokes Claude directly per event. Dead code path — kept compiling for the eventual decommission commit.
+- **`MEGA_USE_SPOOL=true`** (current): `slack/webhook.ts` receives Events API HTTPS deliveries at `/slack/webhook`; `slack/spool-relay.ts` owns the per-fork outbound. The Mega consumer (`core/spool-loop.ts::startSlackV2`) tails each per-Slack-thread fork and invokes Claude; replies route back through the same fork to Slack.
 
 #### Inbound transport
 
-Two mutually-exclusive transports — Slack delivers events on whichever the app is configured for:
+Slack delivers events via HTTPS POST to `/slack/webhook`, signed with the app's Signing Secret. Implemented in `slack/webhook.ts`. Gated on `SLACK_SIGNING_SECRET` in `.env`. The Socket Mode WebSocket transport was retired on 2026-05-11.
 
-- **Events API webhook (current)**: HTTPS POST to `/slack/webhook` signed with the app's Signing Secret. Gated on `SLACK_SIGNING_SECRET` in `.env`. Implemented in `slack/webhook.ts`.
-- **Socket Mode (legacy)**: WebSocket via `apps.connections.open`. Gated on `SLACK_APP_TOKEN`. Implemented in `slack/spool-relay.ts::startInbound`.
-
-Both transports flow through the same `handleSlackEvent` intake. After the Events API switch, Socket Mode stays code-resident for one cleanup commit, then `core/websocket.ts` deletes.
-
-#### Setup (Events API mode)
+#### Setup
 1. Create or update the Slack app at api.slack.com using `slack/manifest.json`. The manifest sets `event_subscriptions.request_url = https://india-desert.exe.xyz/slack/webhook` and `socket_mode_enabled: false`. Bot events: `app_mention`, `message.im`, `message.channels`, `message.groups`, `message.mpim`, `assistant_thread_started`, `assistant_thread_context_changed`. Scopes: `*:history` + `chat:write` + `reactions:write` + others (see manifest).
 2. Grab the **Signing Secret** from the app's "Basic Information" page → `SLACK_SIGNING_SECRET` in `.env`.
 3. Install to workspace → `SLACK_BOT_TOKEN`. No app-level token needed.
