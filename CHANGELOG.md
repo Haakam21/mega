@@ -2,6 +2,39 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-05-11 — Migrated AgentMail + Slack to fabric (broker-of-record)
+
+Cut Mega's own webhook handlers and outbound relays for the two webhook-capable channels. Provider integrations now live in fabric (`https://fabric.delivery`). Mega is a Spool consumer.
+
+**AgentMail** (mega commit `5117bb6`)
+- Deleted `agentmail/{webhook,spool-relay,webhook.test,e2e.test}.ts`.
+- `core/spool-loop.ts::startAgentMailV2` mirrors the Slack v2 pattern: discovery cursor on `MEGA_AGENTMAIL_PARENT` → per-email-thread fork consumers (one Claude session per email thread).
+- Live cutover: created fabric connector `465bc8ee-…` for `mega1@agentmail.to`; created Spool thread `mega/agentmail` under `mega@india-desert.exe.xyz`, invited `fabric-prod` as writer; created fork=true inbound + outbound bindings; deleted the old AgentMail webhook pointing at `india-desert.exe.xyz`; set `MEGA_AGENTMAIL_PARENT=mega/agentmail`. End-to-end verified with a real email round-trip in ~8s.
+
+**Slack** (mega commit `aed773d`, follow-up `d131212`, `7e7d9d4`)
+- Deleted `slack/{webhook,spool-relay,webhook.test,spool-relay.test}.ts`. Kept `slack/manifest.json` with the request_url repointed at `https://fabric.delivery/slack/webhook/e78ada47-…`.
+- `core/spool-loop.ts`:
+  - `startSlackV2` no longer calls `startForkOutbound` (fabric handles outbound).
+  - Removed `fetchThreadHistory` — Claude session continuity (per-thread sessionId) + Spool fork events carry context.
+  - Cursor name bumped to `mega-slack-inbound-v2`; type filter dropped (fabric publishes with the actual Slack event type — `app_mention` no longer matches a `type=message` filter).
+  - `shouldRespondSlack` filter: drop on `bot_id` / `app_id` / `subtype=bot_message` to stop the bot from re-invoking on its own replies. Accept `app_mention`, DM, and follow-up `message` in forks Mega has already replied to.
+  - `thread_ts ?? ts` fallback for top-level @mentions.
+- Live cutover: fabric Slack connector with `thinking_emoji=thinking_face`; manual manifest reinstall in Slack app admin; Spool thread `slack/<bot_user_id>` already owned by Mega → invited `fabric-prod` as writer; fork=true inbound + outbound bindings.
+- Caught two bugs during cutover: (1) bot-reply loop (mega + fabric both fixed; bot-authored events drop), (2) duplicate dispatches because two prod fabric ECS tasks ran the supervisor simultaneously — temporarily scaled prod to `desiredCount: 1`. Real architectural follow-up: leader-elect or split the receiver from the supervisor.
+
+**Fabric features that landed for the Slack migration** (fabric repo)
+- `bindings.filter` now applies on inbound publish as well as outbound tail (`172c267`).
+- Slack connector `thinking_emoji` config → fire-and-forget `reactions.add` on inbound, `reactions.remove` on outbound (`172c267`). Skips bot-authored events (`bdac1f7`).
+- Prod stack `desiredCount: 1` (`bfd7443`) pending supervisor coordination.
+
+**Docs/memories synced**
+- `CLAUDE.md` "How Slack Works" rewritten to fabric-brokered model. AgentMail section was already updated during the earlier AgentMail cutover.
+- `README.md` rewritten from scratch — "WebSocket delivers email events" was three architectures stale.
+- `memories/projects/mega.md` rewritten with current architecture + an explicit "stale, ignore" callout for the WebSocket-era content.
+- `PLAN.md` retired.
+
+---
+
 ## 2026-05-11 — Slack on Events API + v1 channels decommissioned
 
 Cuts the last WebSocket out of the runtime and finishes the migration to a single webhook-based architecture.
