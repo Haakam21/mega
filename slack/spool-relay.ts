@@ -100,13 +100,28 @@ export async function startInbound(spool: SpoolClient): Promise<void> {
       if (data.type !== "events_api") return;
       const evt = data.payload?.event;
       if (!evt) return;
-      if (evt.type !== "message" && evt.type !== "app_mention") return;
-      if (evt.bot_id || evt.user === myId) return;
-      if (evt.subtype && evt.subtype !== "file_share") return;
-
-      void publishInbound(spool, thread, evt, data.envelope_id, myId);
+      void handleSlackEvent(spool, evt, data.envelope_id);
     },
   });
+}
+
+/** Shared inbound intake — called from both the Socket Mode WebSocket
+ *  handler and the Events API webhook handler. Applies the type/author/
+ *  subtype filter, then delegates to `publishInbound`. The transports
+ *  differ only in how they respond to Slack (envelope ack for Socket
+ *  Mode, HTTP 200 for webhook), which stays in the transport handler. */
+export async function handleSlackEvent(
+  spool: SpoolClient,
+  evt: any,
+  eventId: string | undefined
+): Promise<void> {
+  if (!evt) return;
+  if (evt.type !== "message" && evt.type !== "app_mention") return;
+  const myId = await getBotUserId();
+  if (evt.bot_id || evt.user === myId) return;
+  if (evt.subtype && evt.subtype !== "file_share") return;
+  const parent = await slackThread();
+  await publishInbound(spool, parent, evt, eventId, myId);
 }
 
 async function publishInbound(
@@ -206,7 +221,17 @@ export function startForkOutbound(spool: SpoolClient, fork: string): void {
         `[slack-spool] outbound: cursor=${cursor.id} on ${fork} from seq=${cursor.cursor_seq}`
       );
       for await (const ev of spool.tailCursor(cursor.id)) {
-        await handleOutbound(ev);
+        // Per-event try/catch — one bad chat.postMessage (channel
+        // archived, bot kicked, transient 5xx) must not tear down the
+        // tail. Same fix shape as agentmail's outbound.
+        try {
+          await handleOutbound(ev);
+        } catch (e) {
+          console.error(
+            `[slack-spool] outbound: failed seq=${ev.seq} on ${fork}, advancing anyway:`,
+            e
+          );
+        }
         await spool.ackCursor(cursor.id, ev.seq + 1);
       }
     } catch (e) {

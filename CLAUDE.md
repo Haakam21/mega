@@ -71,8 +71,10 @@ mega/
 ├── slack/
 │   ├── channel.ts     # Direct Slack channel (used when MEGA_USE_SPOOL=false)
 │   ├── channel.test.ts # Unit tests for buildPrompt
-│   ├── spool-relay.ts # Slack ↔ Spool v2 relay (still WebSocket inbound — Socket Mode)
+│   ├── spool-relay.ts # Outbound: Spool message.end → chat.postMessage. Shared handleSlackEvent intake. Legacy Socket Mode inbound still resident; deletes after Events API cutover.
 │   ├── spool-relay.test.ts # Unit tests for slackForkName + intake helpers
+│   ├── webhook.ts     # Inbound: /slack/webhook (Slack-signed) → handleSlackEvent
+│   ├── webhook.test.ts # Unit tests for verifySlackSignature
 │   └── manifest.json  # Slack app manifest — paste into api.slack.com
 ├── linear/
 │   ├── channel.ts     # Direct Linear channel (used when MEGA_USE_SPOOL=false)
@@ -138,6 +140,7 @@ Testing hooks: `MEGA_CLAUDE_BIN` swaps the binary (defaults to `claude`), used b
 | `MEGA_SEEN_EVENTS_PATH` | `<repo>/.seen_events` | dedup file path (test override) |
 | `LINEAR_WEBHOOK_SECRET` | (none) | HMAC-SHA256 signing secret for Linear webhooks |
 | `AGENTMAIL_WEBHOOK_SECRET` | (none) | Svix signing secret (`whsec_…`) for the AgentMail webhook route |
+| `SLACK_SIGNING_SECRET` | (none) | Slack app's Signing Secret. Gates the Events API webhook route at `/slack/webhook`. |
 | `MEGA_HTTP_PORT` | `8000` | Shared HTTP server port (all webhook routes). Single public port — exe.dev forwards 8000 by default. |
 | `MEGA_LINEAR_PORT` | `8000` | HTTP server port for the legacy `MEGA_USE_SPOOL=false` Linear receiver (`linear/channel.ts`). |
 
@@ -181,12 +184,26 @@ The Slack channel runs in two modes selected by `MEGA_USE_SPOOL`:
 - **`MEGA_USE_SPOOL=false`** (legacy): `slack/channel.ts` connects via Socket Mode and invokes Claude directly per event. One Claude session per Slack thread keyed `slack-${channel}-${thread_ts}`.
 - **`MEGA_USE_SPOOL=true`** (current): `slack/spool-relay.ts` is a Spool bridge — Slack events publish into a Spool fork per Slack thread, the Mega consumer (`core/spool-loop.ts::startSlackV2`) tails them and invokes Claude, and replies route back through the same fork to Slack.
 
-#### Setup (both modes)
-1. Create a Slack app at api.slack.com using `slack/manifest.json`. The manifest subscribes to `app_mention`, `message.im`, `message.channels`, `message.groups`, `message.mpim` and grants the matching `*:history` + `chat:write` + `reactions:write` scopes.
-2. Generate an App-Level Token with `connections:write` → `SLACK_APP_TOKEN`.
-3. Install to workspace → `SLACK_BOT_TOKEN`.
+#### Inbound transport
+
+Two mutually-exclusive transports — Slack delivers events on whichever the app is configured for:
+
+- **Events API webhook (current)**: HTTPS POST to `/slack/webhook` signed with the app's Signing Secret. Gated on `SLACK_SIGNING_SECRET` in `.env`. Implemented in `slack/webhook.ts`.
+- **Socket Mode (legacy)**: WebSocket via `apps.connections.open`. Gated on `SLACK_APP_TOKEN`. Implemented in `slack/spool-relay.ts::startInbound`.
+
+Both transports flow through the same `handleSlackEvent` intake. After the Events API switch, Socket Mode stays code-resident for one cleanup commit, then `core/websocket.ts` deletes.
+
+#### Setup (Events API mode)
+1. Create or update the Slack app at api.slack.com using `slack/manifest.json`. The manifest sets `event_subscriptions.request_url = https://india-desert.exe.xyz/slack/webhook` and `socket_mode_enabled: false`. Bot events: `app_mention`, `message.im`, `message.channels`, `message.groups`, `message.mpim`, `assistant_thread_started`, `assistant_thread_context_changed`. Scopes: `*:history` + `chat:write` + `reactions:write` + others (see manifest).
+2. Grab the **Signing Secret** from the app's "Basic Information" page → `SLACK_SIGNING_SECRET` in `.env`.
+3. Install to workspace → `SLACK_BOT_TOKEN`. No app-level token needed.
 4. Mega appears in Slack's **Agents** tab (via `assistant_view` feature in manifest). Mega can proactively DM users via `conversations.open` + `chat.postMessage` (uses `im:write` scope).
    - Haakam's Slack user ID: `U08TMCS2KRT`, DM channel: `D0AS9T5CP4K`.
+
+#### Webhook verification
+- HMAC-SHA256 over `v0:${x-slack-request-timestamp}:${raw-body}` keyed by the signing secret as a plain-string key. Header `x-slack-signature` carries `v0=<hex>`. 5-minute replay window. Constant-time compare on the full `v0=<hex>` string.
+- One-time `type: "url_verification"` handshake: echo the `challenge` field back as plain text.
+- 3-second response budget — event processing dispatches asynchronously so Spool/Slack-API latencies don't trigger retries.
 
 #### Spool-relay (v2) topology
 - **Root thread** `slack/<bot_user_id>` carries only `thread.forked` audit events. No user messages live here.
