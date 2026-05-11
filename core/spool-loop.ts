@@ -12,7 +12,6 @@
  */
 
 import { invokeWithHandle } from "./invoke";
-import { fetchThreadHistory, startForkOutbound } from "../slack/spool-relay";
 import type { SpoolClient, SpoolEvent } from "./spool";
 
 const AGENTMAIL_SYSTEM_PROMPT =
@@ -233,9 +232,8 @@ export async function startSlackV2(
         if (!active.has(child)) {
           active.add(child);
           spawnSlackForkConsumer(spool, child);
-          startForkOutbound(spool, child);
           console.log(
-            `[spool-loop] slack v2: spawned consumer + outbound for ${child}`
+            `[spool-loop] slack v2: spawned consumer for ${child}`
           );
         }
         await spool.ackCursor(discovery.id, ev.seq + 1);
@@ -272,12 +270,29 @@ function spawnSlackForkConsumer(spool: SpoolClient, fork: string): void {
   })();
 }
 
+/** Per-fork "I've replied here before" memory. Lets us follow up on
+ *  channel-thread messages in conversations Mega has already engaged
+ *  with, without responding to unrelated channel chatter. Reset on
+ *  process restart; first app_mention or DM in a fork re-seeds it. */
+const SLACK_REPLIED_FORKS = new Set<string>();
+
+function shouldRespondSlack(ev: SpoolEvent, fork: string): boolean {
+  const d = ev.data as { type?: unknown; channel_type?: unknown };
+  if (d.type === "app_mention") return true;
+  if (d.channel_type === "im") return true;
+  if (d.type === "message" && SLACK_REPLIED_FORKS.has(fork)) return true;
+  return false;
+}
+
 async function handleSlackInbound(
   spool: SpoolClient,
   thread: string,
   ev: SpoolEvent,
   wakeAt: number
 ): Promise<void> {
+  if (!shouldRespondSlack(ev, thread)) {
+    return;
+  }
   const channel = ev.data.channel as string | undefined;
   const threadTs = ev.data.thread_ts as string | undefined;
   const ts = ev.data.ts as string | undefined;
@@ -288,16 +303,12 @@ async function handleSlackInbound(
     return;
   }
 
-  // Pull the Slack thread's prior messages so Claude has context even
-  // on a fresh session. Best-effort — empty array if the API call fails.
-  let history: any[] = [];
-  try {
-    history = await fetchThreadHistory(channel, threadTs);
-  } catch (e) {
-    console.warn("[spool-loop] slack: thread history fetch failed:", e);
-  }
-
-  const prompt = buildSlackPrompt(ev, history, ts);
+  // No history fetch — Claude's session continuity (sessionId is stable
+  // per-thread) carries prior turns, and every message Slack delivers
+  // already flows through Spool into this fork. Bot-added-to-existing-
+  // thread is the only edge case that loses context; rare enough to
+  // defer until a tenant complains.
+  const prompt = buildSlackPrompt(ev);
   const sessionId = `slack-${channel}-${threadTs}`;
 
   const handle = invokeWithHandle({
@@ -327,22 +338,19 @@ async function handleSlackInbound(
       source: `mega@${process.env.MEGA_DOMAIN ?? "india-desert.exe.xyz"}`,
       data: {
         content: response,
-        // Routing keys for the slack-spool outbound relay. `ts` is the
-        // user's message we reacted to — outbound clears the 🤔 emoji
-        // from it after posting the reply.
+        // Routing keys for fabric's slack outbound dispatch. `ts` is the
+        // user's message id — fabric uses it to clear the thinking-emoji
+        // reaction after posting the reply.
         channel,
         thread_ts: threadTs,
         ts,
       },
     },
   ]);
+  SLACK_REPLIED_FORKS.add(thread);
 }
 
-function buildSlackPrompt(
-  ev: SpoolEvent,
-  history: any[],
-  currentTs: string
-): string {
+function buildSlackPrompt(ev: SpoolEvent): string {
   const d = ev.data;
   const fileNote =
     Array.isArray(d.files) && d.files.length > 0
@@ -351,20 +359,7 @@ function buildSlackPrompt(
           .join(", ")}. You cannot view these yet — let the user know.)`
       : "";
 
-  const priorLines = history
-    .filter((m) => m.ts !== currentTs)
-    .map((m) => {
-      const who = m.bot_id || m.user === d.bot_user_id ? "mega" : m.user;
-      return `[${who}]: ${m.text || "(no text)"}`;
-    });
-  const historyBlock =
-    priorLines.length === 0
-      ? ""
-      : `Thread history (earlier messages in this thread):\n${priorLines.join(
-          "\n"
-        )}\n\n---\n\n`;
-
-  return `${historyBlock}New Slack message:
+  return `New Slack message:
 
 From user: ${d.user}
 Channel: ${d.channel}

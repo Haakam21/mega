@@ -2,8 +2,6 @@ import { startWatchdog } from "./core/watchdog";
 import { startLogRotator } from "./core/log-rotator";
 import { SpoolClient } from "./core/spool";
 import { startAgentMailV2, startSlackV2 } from "./core/spool-loop";
-import { slackThread as slackSpoolThread } from "./slack/spool-relay";
-import { routes as slackWebhookRoutes } from "./slack/webhook";
 import { routes as linearWebhookRoutes } from "./linear/spool-relay";
 import { startHttpServer, type RouteHandler } from "./core/http-server";
 
@@ -18,28 +16,21 @@ console.log(`[mega] spool=${spoolUrl} as mega@${domain}`);
 
 const httpRoutes: Record<string, RouteHandler> = {};
 
-// AgentMail is now brokered by fabric. Mega doesn't receive AgentMail
-// webhooks directly anymore — fabric does, and publishes per-email-thread
-// fork events into MEGA_AGENTMAIL_PARENT. Mega's consumer tails that
-// parent's thread.forked events and spawns one Claude session per fork.
-// Outbound `message.end` events fabric tails and dispatches to AgentMail's
-// reply API.
+// AgentMail + Slack are brokered by fabric (fabric.delivery). Mega owns
+// neither inbound webhooks nor outbound reply paths for those channels.
+// Fabric publishes per-conversation forks into the configured parent
+// thread; Mega's discovery cursor spawns one Claude session per fork.
+// Outbound `message.end` events fabric tails and dispatches.
+
 const agentmailParent = process.env.MEGA_AGENTMAIL_PARENT;
 if (agentmailParent) {
   void startAgentMailV2(spool, agentmailParent);
   channels.push("agentmail");
 }
 
-if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_SIGNING_SECRET) {
-  // Slack inbound arrives via the Events API webhook at /slack/webhook.
-  // The bot token authorizes outbound chat.postMessage + reactions +
-  // conversations.replies; the signing secret authenticates incoming
-  // deliveries.
-  void (async () => {
-    const parent = await slackSpoolThread();
-    await startSlackV2(spool, parent);
-  })();
-  Object.assign(httpRoutes, slackWebhookRoutes(spool));
+const slackParent = process.env.MEGA_SLACK_PARENT;
+if (slackParent) {
+  void startSlackV2(spool, slackParent);
   channels.push("slack");
 }
 

@@ -12,7 +12,7 @@ setup: setup-deps setup-env setup-sessions setup-memfs setup-github
 	@echo "Agent setup complete."
 	@. ./.env && \
 	[ -n "$$MEGA_AGENTMAIL_PARENT" ] && echo "AgentMail (via fabric): $$MEGA_AGENTMAIL_PARENT" || echo "AgentMail: disabled"; \
-	[ -n "$$SLACK_BOT_TOKEN" ] && echo "Slack: enabled" || echo "Slack: disabled"
+	[ -n "$$MEGA_SLACK_PARENT" ] && echo "Slack (via fabric): $$MEGA_SLACK_PARENT" || echo "Slack: disabled"
 	@echo "Run 'make start' to start the agent."
 
 # Step 1: Install dependencies
@@ -70,13 +70,13 @@ setup-env:
 	fi; \
 	agentmail_set=""; slack_set=""; \
 	[ -n "$$MEGA_AGENTMAIL_PARENT" ] && agentmail_set=1; \
-	[ -n "$$SLACK_BOT_TOKEN" ] && [ -n "$$SLACK_SIGNING_SECRET" ] && slack_set=1; \
+	[ -n "$$MEGA_SLACK_PARENT" ] && slack_set=1; \
 	if [ -z "$$agentmail_set" ] && [ -z "$$slack_set" ]; then \
-		echo "Error: at least one channel must be configured in .env (AgentMail via fabric or Slack)."; \
+		echo "Error: at least one channel must be configured in .env (AgentMail or Slack, both via fabric)."; \
 		exit 1; \
 	fi; \
 	[ -n "$$agentmail_set" ] && am="enabled (fabric-brokered)" || am="disabled"; \
-	[ -n "$$slack_set" ] && sl="enabled" || sl="disabled"; \
+	[ -n "$$slack_set" ] && sl="enabled (fabric-brokered)" || sl="disabled"; \
 	echo "Required env OK. Channels — agentmail: $$am, slack: $$sl"
 
 # Step 4: Verify GitHub CLI authentication
@@ -136,7 +136,7 @@ status:
 	@if [ -f .env ]; then \
 		. ./.env; \
 		[ -n "$$MEGA_AGENTMAIL_PARENT" ] && echo "AgentMail (via fabric): $$MEGA_AGENTMAIL_PARENT" || echo "AgentMail: disabled"; \
-		[ -n "$$SLACK_BOT_TOKEN" ] && echo "Slack: enabled" || echo "Slack: disabled"; \
+		[ -n "$$MEGA_SLACK_PARENT" ] && echo "Slack (via fabric): $$MEGA_SLACK_PARENT" || echo "Slack: disabled"; \
 	else \
 		echo "No .env file."; \
 	fi
