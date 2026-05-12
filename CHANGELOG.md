@@ -2,6 +2,39 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-05-12 (session 5) — read_thread + seq awareness + channel-as-parent forks
+
+Two big themes on top of session 4's MCP/SDK split.
+
+**Theme 1: read_thread + agent seq-awareness**
+- Auto-injected `read_thread` MCP tool on every action connector type. Returns the fork's transcript by walking Spool through a per-connector `formatHistoryEntry` (drops bookkeeping/bot-authored noise). Backward-paginated via `before_seq`. Input schema coerces string→number since Claude Code's MCP tools/list advertises an opaque schema.
+- SDK prepends a `[fabric: event seq=N; M earlier event(s) — call read_thread to fetch when useful]` preamble to every prompt. Claude now knows there's lineage available.
+- Per-provider formatters: slack covers app_mention/message/post-message/reactions (drops bot-authored + channel_join/leave); agentmail covers inbound + the current outbound `message.end`; linear emits coarse system entries.
+
+**Theme 2: channel-as-parent fork topology for slack**
+- `slack/<bot>` → `slack/<bot>/<channel>` → `slack/<bot>/<channel>/<ts>`. Top-level messages publish into the channel thread; thread replies publish into per-thread leaves (lazy-created at first reply). `read_thread` on a leaf surfaces channel context via Spool's `include_ancestry=true`.
+- `EventConnectorType.deriveForkKey` now returns `string[]` (path segments). `forkDepth` declared per connector type (slack: 2, others: 1). Dispatcher's `ensureForkPath` idempotently creates each intermediate.
+- Consumer-SDK + action supervisor both gained **recursive discovery** at depth `forkDepth`, plus `listChildren`-at-startup so a persisted discovery cursor past historical `thread.forked` events doesn't strand existing forks.
+- mega's `sessionIdFor(ev, fork)` maps every event to a stable `<channel>/<thread_ts ?? ts>` Claude session — a top-level @mention and its first user thread reply share the same session so `--resume` keeps the conversation continuous across the channel→leaf handoff.
+- Fresh forks (discovered via `thread.forked`) start the inbound cursor at the fork's own `seq_offset` so lineage mode doesn't replay ancestor events the parent consumer already processed.
+
+**Theme 3: Spool redesign — unified ancestry response**
+- `GET /threads/{t}/events?include_ancestry=true` used to return ancestor events in a separate `ancestry[]` array (one segment per parent thread, no filter). Now returns a single contiguous `events[]` spanning lineage root → target, sorted by absolute seq, with the same ns/type filter applied at every level. `AncestrySegment` and the `ancestry` field on `ReadResult` are gone. spool-cursors' existing `read_chain_from` already did the work; spool-api just calls it.
+
+**Reliability fixes shaken out by the deploys**
+- SSE tails in both supervisor and consumer-sdk now reconnect after ECONNRESET with capped (60s) exponential backoff + ±20% jitter. Before this, Spool's ECS rollover left every fabric/mega tail silent until the next process restart.
+- Eager `repliedForks.add(fork)` when the indicator event flows through the inbound cursor — `shouldRespond` filters bot-authored events out, so without this a fresh leaf whose first event is the agent's own reply never registered as "replied" and follow-ups failed the gate.
+- `processEvent` claims the dedup id before `invokeClaude` runs (closing the channel+leaf race on the same event via lineage). `eventId/dedup` no longer passed down to `invokeClaude` — its own has-check would otherwise see the freshly-claimed id and short-circuit.
+
+**Simplify pass**
+- Consolidated `WalkState.activeInbound + activeDiscovery` into a single `visited` set.
+- Hoisted THREAD_NS/FORKED_TYPE constants in the supervisor; dropped non-null assertions made unnecessary by narrowing.
+- Lifted the `if (!data) return null;` guard in `formatSlackHistoryEntry` from three case branches to a single top-of-function check.
+- Local `sleep(ms)` helper in fork-channel.ts replaces inline `new Promise(setTimeout)`.
+- Trimmed multi-paragraph narration comments to non-obvious WHY only.
+
+Acceptance: prod end-to-end — top-level @mention responds once (no double-fire), thread replies trigger the leaf consumer with the same Claude session, `read_thread` returns channel ancestry. 273 fabric / 9 SDK / spool full suite green.
+
 ## 2026-05-12 (session 4) — Fabric MCP tools + consumer SDK + un-opinionate cleanup
 
 Three big shifts on top of session 3's per-direction split.

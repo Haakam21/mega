@@ -83,7 +83,7 @@ mega/
 
 ### How Channels Work
 
-- **AgentMail** and **Slack**: both brokered by fabric, both run through `core/spool-loop.ts::startForkedChannel`. Mega tails a discovery cursor on the configured parent (`MEGA_AGENTMAIL_PARENT` / `MEGA_SLACK_PARENT`) for `thread.forked` events; per fork it spins a Claude session. On startup, Mega also enumerates existing children via `spool.listChildren(parent)` and respawns a consumer for each — the discovery cursor never replays already-ack'd forks, so without that enumeration restart would silently strand pre-existing conversations. Claude's reply publishes `ns=message, type=end` back to the fork; fabric's outbound supervisor tails and dispatches via the provider's API (AgentMail reply / `chat.postMessage`).
+- **AgentMail** and **Slack**: both brokered by fabric, both run through `core/spool-loop.ts::startForkedChannel`. Agentmail runs flat (`depth: 1`) — one fork per email thread. Slack runs nested (`depth: 2`) — bot → channel → per-thread fork, so the agent can call `read_thread` and surface channel context via Spool's `include_ancestry=true`. The SDK does recursive discovery at every level, spawning inbound consumers at depth ≥ 1 and nested discovery cursors at depth < maxDepth; `listChildren` at each level handles startup so existing forks aren't stranded by a persisted cursor that's past their `thread.forked` event. SSE tails reconnect with capped jittered backoff after transient drops. Claude's reply publishes back to the fork; fabric's outbound supervisor tails and dispatches via the provider's API (AgentMail reply / `chat.postMessage`).
 - **Linear**: Mega-owned, inbound-only. Signed webhook at `/linear/webhook`; events filtered to relevant types and published to `linear/hygiene` as a passive audit log (no consumer).
 
 `bun run index.ts` starts the enabled channels. exe.dev forwards a single public port (8000) at `https://<vmname>.exe.xyz/`. Per-event try/catch around each handler so one bad delivery never tears down the tail.
@@ -128,6 +128,7 @@ Flow:
 5. The per-fork consumer reads `ns=agentmail, type=message` in lineage mode, invokes Claude with `sessionId = <fork name>` and a per-invocation MCP config pointing at `https://fabric.delivery/mcp/agentmail-action`. The config bakes the per-event routing headers (`X-Agentmail-Reply-To-Message-Id`, `X-Agentmail-Thread-Id`) so Claude's tool schemas collapse to `reply({ text })`.
 6. If Claude calls `agentmail-action.reply`, fabric's MCP handler header-merges the routing context into the tool input, validates, and publishes `ns=message, type=end` to the fork.
 7. The action supervisor's per-fork tail on the action binding picks up the `message.end` and dispatches via AgentMail's reply API using the `api` credentials slot.
+8. The auto-injected `agentmail-action.read_thread` tool returns the fork's transcript (via Spool's `include_ancestry=true`) when the agent needs older context on a long-running email thread.
 
 #### Setup
 Operator-side (one-time, against fabric). **4 credentials + 4 connectors + 4 bindings** per channel:
@@ -161,16 +162,25 @@ Mega-side:
 
 ### How Slack Works (fabric-brokered)
 
-Same shape as AgentMail. Fabric (`https://fabric.delivery`) handles inbound signature verify + fork-per-thread publish; the action supervisor handles outbound dispatch. Mega is a Spool consumer + MCP caller via the SDK.
+Same broker model as AgentMail, but with **two-level fork topology** to match Slack's channel/thread semantics:
+
+```
+slack/<bot>                              ← binding parent
+└── slack/<bot>/<channel>                ← channel thread (top-level msgs land here)
+    └── slack/<bot>/<channel>/<ts>       ← per-thread fork (thread replies land here)
+```
+
+Top-level channel messages publish into the **channel thread**; thread replies publish into the **per-thread leaf fork** (lazy-created at first reply). When the agent replies to a thread message, calling `read_thread` returns the leaf's events plus every channel-level message that existed before the thread started — Spool's `include_ancestry=true` gives that whole chronicle in one contiguous events array, sorted by absolute seq, with the same ns/type filter applied at every level.
 
 Flow:
 1. Slack delivers an Events API webhook to `https://fabric.delivery/slack-event/webhook/mega-slack-event`.
-2. Fabric verifies the `v0=<hex>` signature against the event connector's `signing` credentials slot, handles `url_verification` if present, parses the `event_callback`, and publishes `ns=slack, type=<event.type>` (app_mention, message, etc.) into the forked child `<MEGA_SLACK_PARENT>/<channel>-<thread_ts ?? ts>`. **No side effects against Slack** — the thinking-face reaction is now a consumer-side choice.
-3. The SDK's `startForkedChannel` tails the parent's discovery cursor and spawns a per-fork consumer for each `thread.forked` event.
-4. Per event, mega's `shouldConsiderReplySlack` gate filters: skips bot-authored events (loop prevention) and channel chatter mega isn't addressed by; lets through `app_mention`, DMs, and messages in forks mega has previously replied to.
-5. If the gate passes, the SDK invokes Claude with `sessionId = <fork name>` and an MCP config pointing at `https://fabric.delivery/mcp/slack-action`. Per-invocation headers (`X-Slack-Channel`, `X-Slack-Ts`, `X-Slack-Thread-Ts`) auto-fill the tools' routing fields.
-6. Claude composes UX via `slack-action.react({ name })`, `slack-action.post_message({ text })`, and `slack-action.unreact({ name })` — typically reacting `thinking_face` first, posting the reply, then clearing the reaction. Each tool call hops fabric MCP → Spool publish → action-supervisor tail → Slack API.
-7. The replied-state primer marks the fork as "replied" by reading prior `ns=slack, type=post-message` events (via the SDK's `repliedIndicator` config) — restart re-derives state from Spool history instead of forgetting follow-up gating.
+2. Fabric verifies the `v0=<hex>` signature against the event connector's `signing` credentials slot, handles `url_verification` if present, and calls `slack-event.deriveForkKey` which returns `[channel]` for top-level messages or `[channel, thread_ts]` for thread replies. The dispatcher walks the path: ensures each segment exists as a fork of the previous (idempotent), then publishes `ns=slack, type=<event.type>` (app_mention, message, …) into the deepest segment.
+3. The SDK's `startForkedChannel` runs **recursive discovery at `depth: 2`**: a discovery cursor on `slack/<bot>` finds channels; for each channel a per-channel inbound consumer AND a nested discovery cursor are spawned; the nested discovery finds per-thread leaves and spawns per-leaf inbound consumers. At startup, `listChildren` enumerates each level so existing forks aren't stranded by a cursor that's past their `thread.forked` event.
+4. Inbound consumers run at **both depths**: depth=1 handles top-level @mentions/DMs in the channel; depth=2 handles thread replies. mega's `shouldConsiderReplySlack` gate skips bot-authored events (loop prevention) and channel chatter that isn't addressed; lets through `app_mention`, DMs, and `type=message` events on forks where the agent has previously replied. `repliedForks` updates eagerly when a `slack.post-message` event flows through the inbound cursor — without this, a fresh per-thread fork whose first event is mega's own reply would never register as "replied" and follow-up thread messages would fail the gate.
+5. Fresh forks (discovered via `thread.forked`) start their inbound cursor at the fork's `seq_offset` (carried in the event's `data`). In lineage mode that puts the cursor exactly at the boundary where the parent ends and the leaf begins, so the leaf doesn't re-process ancestor events the parent consumer already handled.
+6. mega's `sessionIdFor` maps every event — channel-level or fork-level — to a stable `<channel>/<thread_ts ?? ts>` Claude session id. A top-level @mention and its first user thread reply both hit the same session, so Claude `--resume` keeps the conversation continuous across the channel→fork handoff.
+7. mega's MCP config wires `X-Fabric-Fork` to the **prospective leaf** (`slack/<bot>/<channel>/<thread_ts ?? ts>`) on every tool call. Fabric's MCP handler ensures the path exists (lazy fork creation) before publishing, so the agent's first `post_message` from a channel-level event works even though Slack hasn't materialized the thread yet.
+8. Claude composes UX via `slack-action.react({ name })`, `slack-action.post_message({ text })`, and `slack-action.unreact({ name })` — typically reacting `thinking_face` first, posting the reply, then clearing the reaction. Each tool call hops fabric MCP → Spool publish → action-supervisor tail → Slack API. The auto-injected `slack-action.read_thread` tool fetches the fork's transcript (with ancestry) when the agent needs older context.
 
 #### Setup
 Operator-side (one-time, all calls send `X-Client-Id: mega@<MEGA_DOMAIN>`). **2 credentials + 2 connectors + 2 bindings**:
@@ -200,7 +210,7 @@ Operator-side (one-time, all calls send `X-Client-Id: mega@<MEGA_DOMAIN>`). **2 
 
 Mega-side:
 1. Set `MEGA_SLACK_PARENT=slack/<bot_user_id>` in `.env`.
-2. Restart; `startSlackV2` initializes the discovery cursor and waits for forks.
+2. Restart; `startSlack` initializes the bot-level discovery cursor at depth 0 and recursively discovers channel + per-thread forks (`depth: 2`).
 
 Haakam's Slack user ID: `U08TMCS2KRT`, DM channel: `D0AS9T5CP4K`. Mega's bot_user_id: `U0ATAH16PPA`.
 
