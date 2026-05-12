@@ -138,6 +138,9 @@ export async function startSlack(spool: SpoolClient, parent: string): Promise<vo
     dedupId: slackDedupId,
     buildPrompt: buildSlackPrompt,
     systemPrompt: SLACK_SYSTEM_PROMPT,
+    // Slack action's post_message tool publishes `ns=slack, type=post-message`
+    // — that's our "has Mega replied here?" signal.
+    repliedIndicator: { ns: "slack", type: "post-message" },
     mcpServers: ({ fork, event }) => {
       const d = event.data;
       const channel = String(d.channel ?? "");
