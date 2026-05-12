@@ -48,20 +48,11 @@ const SLACK_SYSTEM_PROMPT =
   "(e.g. `white_check_mark` to confirm a request, `eyes` for \"I'm looking at it\").";
 
 const SLACK_CURSORS = {
-  // -v9: reverted v8's seq_mode=local back to lineage. v8's interpretation
-  // of starting_seq in local mode added the thread's seq_offset, leaving
-  // cursors positioned far past head. Now fresh forks start at their own
-  // seq_offset (from thread.forked.data) in lineage mode — which is
-  // exactly the boundary where the parent ends and this fork begins, so
-  // the agent doesn't double-fire on ancestor events.
   discovery: "mega-slack-discovery-v9",
   inbound: "mega-slack-inbound-v9",
 } as const;
 
 const AGENTMAIL_CURSORS = {
-  // -v8: bump alongside slack v9 (lineage mode reinstated; SDK now uses
-  // seq_offset for fresh forks). Single-level forks don't benefit from
-  // the change but keep cursor versions in lockstep.
   discovery: "mega-agentmail-discovery-v8",
   inbound: "mega-agentmail-inbound-v8",
 } as const;
