@@ -19,17 +19,33 @@ import {
 } from "../fabric/packages/consumer-sdk/src";
 
 const AGENTMAIL_SYSTEM_PROMPT =
-  "You are responding via email. If the email warrants a reply, call the " +
-  "`agentmail-action__reply` tool with the reply text. If it doesn't " +
-  "warrant a reply (auto-replies, list mail, side conversations between " +
-  "other people), simply do not call the tool and end your turn.";
+  "You are responding via email. If the email warrants a reply, call " +
+  "the `agentmail-action__reply` tool with `text` set to your reply body. " +
+  "Routing context (reply_to_message_id, thread_id) is pre-filled from " +
+  "the invocation headers — you only need to supply `text`. If the email " +
+  "doesn't warrant a reply (auto-replies, list mail, side conversations " +
+  "between other people), simply do not call the tool and end your turn.";
 
 const SLACK_SYSTEM_PROMPT =
-  "You are responding in Slack. If the message warrants a reply, call the " +
-  "`slack-action__reply` tool with the reply text. If it doesn't warrant " +
-  "a reply (side conversations between other people, off-topic chatter, " +
-  "messages not addressed to you), simply do not call the tool and end " +
-  "your turn.";
+  "You are responding in Slack. Routing context (channel, ts, thread_ts) " +
+  "is pre-filled from the invocation headers for every tool that takes " +
+  "those fields — you only need to supply the variable bits (text, emoji " +
+  "name).\n\n" +
+  "Available tools:\n" +
+  "  • slack-action__post_message({ text }) — send a Slack reply.\n" +
+  "  • slack-action__react({ name }) — add an emoji reaction to the user's " +
+  "message. `name` is the Slack emoji name without colons (`thinking_face`, " +
+  "`white_check_mark`, `fire`, etc.).\n" +
+  "  • slack-action__unreact({ name }) — remove a reaction you added.\n\n" +
+  "Decision flow:\n" +
+  "1. If the message doesn't warrant a reply (side conversations between " +
+  "other people, off-topic chatter, messages not addressed to you), end " +
+  "your turn without calling any tool.\n" +
+  "2. Otherwise call `react({ name: \"thinking_face\" })` immediately so the " +
+  "user sees you're working on it, compose your response, call " +
+  "`post_message({ text })`, then `unreact({ name: \"thinking_face\" })` to " +
+  "clear the thinking reaction. Use other reactions whenever they fit " +
+  "(e.g. `white_check_mark` to confirm a request, `eyes` for \"I'm looking at it\").";
 
 const SLACK_CURSORS = {
   // -v6 bump: v5 hit a Spool pagination gotcha — `next_seq` with `limit=1`
@@ -95,11 +111,8 @@ function buildSlackPrompt(ev: SpoolEvent): string {
 From user: ${d.user}
 Channel: ${d.channel}
 Thread: ${d.thread_ts ?? d.ts}
-ts: ${d.ts}
 
-${d.text || "(no text)"}${fileNote}
-
-If you decide to reply, call the slack-action__reply tool with channel="${d.channel}", ts="${d.ts}", thread_ts="${d.thread_ts ?? d.ts}", and your reply text.`;
+${d.text || "(no text)"}${fileNote}`;
 }
 
 function buildAgentMailPrompt(ev: SpoolEvent): string {
@@ -110,12 +123,8 @@ function buildAgentMailPrompt(ev: SpoolEvent): string {
 From: ${d.from}
 To: ${to}
 Subject: ${d.subject}
-Thread ID: ${d.thread_id}
-Message ID: ${d.message_id}
 
-${d.text || "(no text content)"}
-
-If you decide to reply, call the agentmail-action__reply tool with reply_to_message_id="${d.message_id}", thread_id="${d.thread_id}", and your reply text.`;
+${d.text || "(no text content)"}`;
 }
 
 export async function startSlack(spool: SpoolClient, parent: string): Promise<void> {
@@ -129,15 +138,24 @@ export async function startSlack(spool: SpoolClient, parent: string): Promise<vo
     dedupId: slackDedupId,
     buildPrompt: buildSlackPrompt,
     systemPrompt: SLACK_SYSTEM_PROMPT,
-    mcpServers: ({ fork }) => ({
-      "slack-action": {
-        url: `${FABRIC_URL}/mcp/slack-action`,
-        headers: {
-          "X-Client-Id": CLIENT_ID,
-          "X-Fabric-Fork": fork,
+    mcpServers: ({ fork, event }) => {
+      const d = event.data;
+      const channel = String(d.channel ?? "");
+      const ts = String(d.ts ?? "");
+      const threadTs = String(d.thread_ts ?? d.ts ?? "");
+      return {
+        "slack-action": {
+          url: `${FABRIC_URL}/mcp/slack-action`,
+          headers: {
+            "X-Client-Id": CLIENT_ID,
+            "X-Fabric-Fork": fork,
+            "X-Slack-Channel": channel,
+            "X-Slack-Ts": ts,
+            "X-Slack-Thread-Ts": threadTs,
+          },
         },
-      },
-    }),
+      };
+    },
   });
 }
 
@@ -151,15 +169,20 @@ export async function startAgentMail(spool: SpoolClient, parent: string): Promis
     shouldRespond: () => true,
     buildPrompt: buildAgentMailPrompt,
     systemPrompt: AGENTMAIL_SYSTEM_PROMPT,
-    mcpServers: ({ fork }) => ({
-      "agentmail-action": {
-        url: `${FABRIC_URL}/mcp/agentmail-action`,
-        headers: {
-          "X-Client-Id": CLIENT_ID,
-          "X-Fabric-Fork": fork,
+    mcpServers: ({ fork, event }) => {
+      const d = event.data;
+      return {
+        "agentmail-action": {
+          url: `${FABRIC_URL}/mcp/agentmail-action`,
+          headers: {
+            "X-Client-Id": CLIENT_ID,
+            "X-Fabric-Fork": fork,
+            "X-Agentmail-Reply-To-Message-Id": String(d.message_id ?? ""),
+            "X-Agentmail-Thread-Id": String(d.thread_id ?? ""),
+          },
         },
-      },
-    }),
+      };
+    },
   });
 }
 
