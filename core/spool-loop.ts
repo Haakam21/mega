@@ -48,11 +48,11 @@ const SLACK_SYSTEM_PROMPT =
   "(e.g. `white_check_mark` to confirm a request, `eyes` for \"I'm looking at it\").";
 
 const SLACK_CURSORS = {
-  // -v6 bump: v5 hit a Spool pagination gotcha — `next_seq` with `limit=1`
-  // is `first_seq+1`, not the head. v6 cursors are created after a proper
-  // pagination walk so they start at the true head.
-  discovery: "mega-slack-discovery-v6",
-  inbound: "mega-slack-inbound-v6",
+  // -v7: fork topology changed to two-level (channel → per-thread fork).
+  // Old v6 cursors live on now-orphaned flat forks; new cursors are
+  // created against the new topology so they start fresh at head.
+  discovery: "mega-slack-discovery-v7",
+  inbound: "mega-slack-inbound-v7",
 } as const;
 
 const AGENTMAIL_CURSORS = {
@@ -147,23 +147,54 @@ function mcpServer(
   return { [name]: { url: `${FABRIC_URL}/mcp/${name}`, headers } };
 }
 
+/** Compute the per-thread leaf fork name for a Slack event, given the
+ *  fork it currently lives in. Top-level channel events live in the
+ *  channel thread `<binding>/<channel>`; the leaf is `<binding>/<channel>/<ts>`
+ *  (Slack creates a thread when Mega replies with thread_ts=ts). Thread
+ *  replies already live in the leaf, so the input fork is the leaf. */
+function slackLeafFork(ev: { data: Record<string, unknown> }, fork: string): string {
+  const d = ev.data;
+  const ts =
+    typeof d?.thread_ts === "string"
+      ? d.thread_ts
+      : typeof d?.ts === "string"
+        ? d.ts
+        : null;
+  if (!ts) return fork;
+  return fork.endsWith(`/${ts}`) ? fork : `${fork}/${ts}`;
+}
+
 export async function startSlack(spool: SpoolClient, parent: string): Promise<void> {
   return startForkedChannel({
     spool,
     parent,
     label: "slack",
     cursors: SLACK_CURSORS,
+    // Two-level discovery: parent (bot) → channel forks → per-thread forks.
+    // Inbound consumers run at depth 1 (channel: top-level @mentions, DMs)
+    // and depth 2 (per-thread fork: thread replies).
+    depth: 2,
     inboundFilter: { ns: "slack" },
     shouldRespond: shouldConsiderReplySlack,
     dedupId: slackDedupId,
     buildPrompt: buildSlackPrompt,
     systemPrompt: SLACK_SYSTEM_PROMPT,
+    // Stable session id across the "top-level @mention in channel →
+    // first user thread reply on per-thread fork" handoff. Both events
+    // map to the same leaf fork name; Claude --resume keeps the
+    // conversation continuous.
+    sessionIdFor: (ev, { fork }) => slackLeafFork(ev, fork),
     // slack-action's post_message tool publishes ns=slack, type=post-message
     // — that's mega's "has replied here?" signal.
     repliedIndicator: { ns: "slack", type: "post-message" },
     mcpServers: ({ fork, event }) => {
       const d = event.data as Record<string, unknown>;
-      return mcpServer("slack-action", fork, {
+      // X-Fabric-Fork points at the LEAF (per-thread fork). For top-level
+      // events on the channel thread, this is the prospective leaf that
+      // fabric's MCP handler creates lazily on Mega's first post_message.
+      // For thread-reply events the input fork is already the leaf.
+      const leafFork = slackLeafFork(event, fork);
+      return mcpServer("slack-action", leafFork, {
         "X-Slack-Channel": typeof d.channel === "string" ? d.channel : undefined,
         "X-Slack-Ts": typeof d.ts === "string" ? d.ts : undefined,
         "X-Slack-Thread-Ts":
