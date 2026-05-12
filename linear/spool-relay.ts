@@ -9,7 +9,7 @@
  */
 
 import { createHash, createHmac, timingSafeEqual } from "crypto";
-import type { SpoolClient } from "../core/spool";
+import type { SpoolClient } from "../fabric/packages/consumer-sdk/src";
 import type { RouteHandler } from "../core/http-server";
 
 const webhookSecret = process.env.LINEAR_WEBHOOK_SECRET!;

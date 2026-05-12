@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { slackDedupId } from "./spool-loop";
-import type { SpoolEvent } from "./spool";
+import type { SpoolEvent } from "../fabric/packages/consumer-sdk/src";
 
 function ev(data: Record<string, unknown>, extra: Partial<SpoolEvent> = {}): SpoolEvent {
   return {

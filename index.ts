@@ -1,7 +1,7 @@
 import { startWatchdog } from "./core/watchdog";
 import { startLogRotator } from "./core/log-rotator";
-import { SpoolClient } from "./core/spool";
-import { startAgentMailV2, startSlackV2 } from "./core/spool-loop";
+import { SpoolClient } from "./fabric/packages/consumer-sdk/src";
+import { startAgentMail, startSlack } from "./core/spool-loop";
 import { routes as linearWebhookRoutes } from "./linear/spool-relay";
 import { startHttpServer, type RouteHandler } from "./core/http-server";
 
@@ -24,13 +24,13 @@ const httpRoutes: Record<string, RouteHandler> = {};
 
 const agentmailParent = process.env.MEGA_AGENTMAIL_PARENT;
 if (agentmailParent) {
-  void startAgentMailV2(spool, agentmailParent);
+  void startAgentMail(spool, agentmailParent);
   channels.push("agentmail");
 }
 
 const slackParent = process.env.MEGA_SLACK_PARENT;
 if (slackParent) {
-  void startSlackV2(spool, slackParent);
+  void startSlack(spool, slackParent);
   channels.push("slack");
 }
 
