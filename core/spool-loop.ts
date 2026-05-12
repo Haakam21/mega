@@ -48,16 +48,20 @@ const SLACK_SYSTEM_PROMPT =
   "(e.g. `white_check_mark` to confirm a request, `eyes` for \"I'm looking at it\").";
 
 const SLACK_CURSORS = {
-  // -v7: fork topology changed to two-level (channel → per-thread fork).
-  // Old v6 cursors live on now-orphaned flat forks; new cursors are
-  // created against the new topology so they start fresh at head.
-  discovery: "mega-slack-discovery-v7",
-  inbound: "mega-slack-inbound-v7",
+  // -v8: inbound cursors switched from seq_mode=lineage to seq_mode=local
+  // to stop the nested-fork double-fire (leaf cursors were replaying their
+  // channel parent's ancestor events). Spool locks seq_mode at cursor
+  // creation, so a name bump is required.
+  discovery: "mega-slack-discovery-v8",
+  inbound: "mega-slack-inbound-v8",
 } as const;
 
 const AGENTMAIL_CURSORS = {
-  discovery: "mega-agentmail-discovery-v6",
-  inbound: "mega-agentmail-inbound-v6",
+  // -v7: seq_mode bumped to local (see SLACK_CURSORS comment). Agentmail
+  // doesn't currently have nested forks, but keep parity to avoid
+  // accidental future drift.
+  discovery: "mega-agentmail-discovery-v7",
+  inbound: "mega-agentmail-inbound-v7",
 } as const;
 
 const FABRIC_URL = process.env.FABRIC_URL ?? "https://fabric.delivery";
