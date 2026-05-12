@@ -127,6 +127,26 @@ Subject: ${d.subject}
 ${d.text || "(no text content)"}`;
 }
 
+/** Build a single MCP server entry with the framework headers fabric
+ *  always expects (X-Client-Id, X-Fabric-Fork) plus any provider-specific
+ *  routing headers. Undefined provider header values are dropped so the
+ *  tool's Zod `min(1)` validation reports "missing field" rather than
+ *  swallowing an empty string. */
+function mcpServer(
+  name: string,
+  fork: string,
+  providerHeaders: Record<string, string | undefined>,
+): Record<string, { url: string; headers: Record<string, string> }> {
+  const headers: Record<string, string> = {
+    "X-Client-Id": CLIENT_ID,
+    "X-Fabric-Fork": fork,
+  };
+  for (const [k, v] of Object.entries(providerHeaders)) {
+    if (typeof v === "string" && v.length > 0) headers[k] = v;
+  }
+  return { [name]: { url: `${FABRIC_URL}/mcp/${name}`, headers } };
+}
+
 export async function startSlack(spool: SpoolClient, parent: string): Promise<void> {
   return startForkedChannel({
     spool,
@@ -138,26 +158,21 @@ export async function startSlack(spool: SpoolClient, parent: string): Promise<vo
     dedupId: slackDedupId,
     buildPrompt: buildSlackPrompt,
     systemPrompt: SLACK_SYSTEM_PROMPT,
-    // Slack action's post_message tool publishes `ns=slack, type=post-message`
-    // — that's our "has Mega replied here?" signal.
+    // slack-action's post_message tool publishes ns=slack, type=post-message
+    // — that's mega's "has replied here?" signal.
     repliedIndicator: { ns: "slack", type: "post-message" },
     mcpServers: ({ fork, event }) => {
-      const d = event.data;
-      const channel = String(d.channel ?? "");
-      const ts = String(d.ts ?? "");
-      const threadTs = String(d.thread_ts ?? d.ts ?? "");
-      return {
-        "slack-action": {
-          url: `${FABRIC_URL}/mcp/slack-action`,
-          headers: {
-            "X-Client-Id": CLIENT_ID,
-            "X-Fabric-Fork": fork,
-            "X-Slack-Channel": channel,
-            "X-Slack-Ts": ts,
-            "X-Slack-Thread-Ts": threadTs,
-          },
-        },
-      };
+      const d = event.data as Record<string, unknown>;
+      return mcpServer("slack-action", fork, {
+        "X-Slack-Channel": typeof d.channel === "string" ? d.channel : undefined,
+        "X-Slack-Ts": typeof d.ts === "string" ? d.ts : undefined,
+        "X-Slack-Thread-Ts":
+          typeof d.thread_ts === "string"
+            ? d.thread_ts
+            : typeof d.ts === "string"
+              ? d.ts
+              : undefined,
+      });
     },
   });
 }
@@ -173,23 +188,13 @@ export async function startAgentMail(spool: SpoolClient, parent: string): Promis
     buildPrompt: buildAgentMailPrompt,
     systemPrompt: AGENTMAIL_SYSTEM_PROMPT,
     mcpServers: ({ fork, event }) => {
-      const d = event.data;
-      return {
-        "agentmail-action": {
-          url: `${FABRIC_URL}/mcp/agentmail-action`,
-          headers: {
-            "X-Client-Id": CLIENT_ID,
-            "X-Fabric-Fork": fork,
-            "X-Agentmail-Reply-To-Message-Id": String(d.message_id ?? ""),
-            "X-Agentmail-Thread-Id": String(d.thread_id ?? ""),
-          },
-        },
-      };
+      const d = event.data as Record<string, unknown>;
+      return mcpServer("agentmail-action", fork, {
+        "X-Agentmail-Reply-To-Message-Id":
+          typeof d.message_id === "string" ? d.message_id : undefined,
+        "X-Agentmail-Thread-Id":
+          typeof d.thread_id === "string" ? d.thread_id : undefined,
+      });
     },
   });
 }
-
-// Back-compat exports — index.ts still imports the v2 names. Drop in a
-// follow-up once the dust settles.
-export const startSlackV2 = startSlack;
-export const startAgentMailV2 = startAgentMail;

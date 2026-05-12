@@ -2,6 +2,36 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-05-12 (session 4) — Fabric MCP tools + consumer SDK + un-opinionate cleanup
+
+Three big shifts on top of session 3's per-direction split.
+
+**Vocabulary rename: `event` / `action`**
+- TS interfaces renamed `InboundConnectorType` → `EventConnectorType`, `OutboundConnectorType` → `ActionConnectorType`. The new names describe agent semantic; the platform stops using "inbound/outbound" anywhere it's user-visible.
+- Connector type strings rewritten in migration `0004`: `slack-inbound` → `slack-event`, `slack-outbound` → `slack-action`, same for agentmail; `linear-inbound` → `linear-event`.
+
+**Stable webhook slugs**
+- Connectors carry an operator-chosen `slug` (globally unique, URL-safe). `POST /<type>/webhook/<slug-or-uuid>` resolves by slug first. mega's Slack manifest now uses `https://fabric.delivery/slack-event/webhook/mega-slack-event` — stable across any future connector rewire (so no more manifest re-paste).
+
+**Hosted MCP endpoint + generic action tools**
+- New `POST /mcp/<action_type>` on fabric (JSON-RPC 2.0 over HTTP, ~250 LoC). Action types declare `mcpTools[]`. Tools have `inputSchema` (Zod), `toEvent(input)`, and a `headerMap` that the MCP handler merges before validation. Tenants pre-fill per-event routing via MCP headers; Claude only supplies the variable bits.
+- slack-action tools: `post_message`, `react`, `unreact` (any emoji name, mirroring Slack's primitives). agentmail-action tool: `reply`.
+- **Removed** fabric-baked UX opinions: the thinking-emoji auto-react and auto-cleanup. Mega's system prompt suggests reacting `thinking_face` while working but Claude picks any emoji freely.
+
+**@fabric/consumer-sdk**
+- Extracted mega's `core/spool-loop.ts` + `core/invoke.ts` + `core/spool.ts` into `fabric/packages/consumer-sdk/`. Mega imports via relative path.
+- Owns: `SpoolClient`, `startForkedChannel` (fork-discovery + per-fork tail + dedup + Claude invocation), `invokeClaude` (CLI spawn with per-invocation MCP config + session-id fallback + tree-kill on timeout).
+- `repliedIndicator: {ns, type}` channel-config option drives the SDK's "has the agent replied here?" gate — needed because the new generic tools emit `ns=slack, type=post-message` instead of the old `ns=message, type=end`.
+- Cursor-positioning subtleties resolved (final v6 cursors): fresh forks start at seq=0; respawned forks start at head via paginated `latestSeq`.
+
+**Simplify pass**
+- Indexed `mcpTools` by name on registry register for O(1) `tools/call` lookup.
+- Factored slack `react`/`unreact` into a `reactionTool(name, desc, eventType)` helper.
+- Unified SDK's `primeRepliedFork` + `refreshRepliedFork` into one `markRepliedIfPresent`.
+- Mega's per-channel `mcpServers` callbacks collapsed onto a `mcpServer(name, fork, providerHeaders)` helper. Empty-string header trap fixed (missing fields now surface as Zod "missing field" instead of silently passing an empty string downstream).
+
+Acceptance: end-to-end on prod across Slack (new thread, follow-up in replied thread, channel chatter no-reply) and AgentMail. 235 fabric / 5 SDK / 55 mega tests green.
+
 ## 2026-05-11 (session 3) — Fabric split per-direction connector types + credentials primitive
 
 Rewrote fabric to decouple inbound from outbound. Operators want a flexible mix-and-match topology; the v0 `mode: inbound|outbound|both` connectors couldn't express it.

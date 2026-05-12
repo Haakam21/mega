@@ -37,10 +37,10 @@ This repo is a portable agent image. Clone it, run `make setup`, get a running d
 - **Claude Code** is the agent — all reasoning and action
 - **memfs** provides shared memory across all instances
 - **Channels** are independently optional; at least one must be configured in `.env`.
-    - **AgentMail** — brokered by [fabric](https://github.com/Haakam21/fabric). Mega no longer owns the AgentMail webhook or reply path. Fabric receives the Svix webhook, forks per-email-thread, publishes into the `MEGA_AGENTMAIL_PARENT` Spool thread; Mega's `startAgentMailV2` consumer tails the discovery cursor and spawns one Claude session per fork. Outbound `message.end` events fabric tails and dispatches to AgentMail's reply API.
-    - **Slack** — brokered by fabric. Mega no longer owns the Slack webhook or reply path. Fabric verifies the Events API signature, forks per-Slack-thread, publishes into the `MEGA_SLACK_PARENT` Spool thread; Mega's `startSlackV2` consumer tails the discovery cursor and spawns one Claude session per fork. Outbound `message.end` events fabric tails and posts via `chat.postMessage`.
+    - **AgentMail** — brokered by [fabric](https://github.com/Haakam21/fabric). Fabric receives the Svix webhook on `agentmail-event`, forks per-email-thread, publishes into the `MEGA_AGENTMAIL_PARENT` Spool thread. Mega's `startAgentMail` consumer (from `@fabric/consumer-sdk`) tails the discovery cursor and spawns one Claude session per fork. Claude calls the `agentmail-action.reply` MCP tool on fabric's hosted endpoint; the tool publishes `ns=message, type=end` and fabric's action supervisor dispatches via AgentMail's reply API.
+    - **Slack** — brokered by fabric, same pattern. `slack-event` receives the Events API webhook; `slack-action` exposes `post_message`, `react`, `unreact` MCP tools that Claude composes (the thinking-face UX is now a tenant prompt convention, not fabric-side opinion).
     - **Linear** (`LINEAR_WEBHOOK_SECRET`) — Linear HMAC webhook at `/linear/webhook`; relevant events logged to the `linear/hygiene` Spool thread for later audit.
-- **Spool** (`MEGA_SPOOL_URL`, default `https://spool.computer`) — the event bus. Mega's consumer loops in `core/spool-loop.ts` tail per-conversation cursors and invoke Claude. AgentMail + Slack both use a per-conversation fork topology: a parent thread carries `thread.forked` events; one Claude session is bound to each fork. Linear writes to a flat `linear/hygiene` thread.
+- **Spool** (`MEGA_SPOOL_URL`, default `https://spool.computer`) — the event bus. Mega's consumer (`core/spool-loop.ts`) is a thin shell over `@fabric/consumer-sdk`'s `startForkedChannel`. AgentMail + Slack both use a per-conversation fork topology: a parent thread carries `thread.forked` events; one Claude session is bound to each fork. Linear writes to a flat `linear/hygiene` thread.
 - **GitHub CLI (`gh`)** enables code review on GitHub PRs
 - **Bun** is the runtime — TypeScript, WebSocket, fetch, and subprocess all built-in
 - **No runtime dependencies beyond bun, jq, gh, and claude**
@@ -56,24 +56,16 @@ mega/
 │   ├── env.ts         # Tiny env-var parsing helpers (parsePositiveInt, etc.)
 │   ├── http-server.ts # Shared Bun HTTP server: one port, path-routed across channels
 │   ├── interval.ts    # startInterval(tick, ms) — shared by watchdog + log-rotator
-│   ├── invoke.ts      # Shared: dedup, invoke claude, return response
 │   ├── log-rotator.ts # Periodic harness.log size cap + truncate-in-place
-│   ├── spool.ts       # Spool TS client
-│   ├── spool-loop.ts  # Spool consumers: AgentMail + Slack discovery + per-fork
+│   ├── spool-loop.ts  # Tenant config + thin shell over @fabric/consumer-sdk
 │   └── watchdog.ts    # Periodic claude-process count + warn (runaway leak guard)
 ├── slack/
-│   ├── spool-relay.ts # Outbound: Spool message.end → chat.postMessage. Shared handleSlackEvent intake.
-│   ├── spool-relay.test.ts # Unit tests for slackForkName + intake helpers
-│   ├── webhook.ts     # Inbound: /slack/webhook (Slack-signed) → handleSlackEvent
-│   ├── webhook.test.ts # Unit tests for verifySlackSignature
 │   └── manifest.json  # Slack app manifest — paste into api.slack.com
 ├── linear/
 │   ├── spool-relay.ts # Inbound: /linear/webhook → Spool linear/hygiene thread
 │   └── spool-relay.test.ts # Unit tests for HMAC + filter + dedup id
-├── test/
-│   ├── mock-claude.sh  # Mock claude CLI for unit tests
-│   ├── slow-claude.sh  # Slow mock for kill/interrupt tests
-│   └── tree-claude.sh  # Mock that spawns a child subprocess (tree-kill tests)
+├── fabric/             # checked-in fabric repo; @fabric/consumer-sdk lives at
+│                       # fabric/packages/consumer-sdk and is imported via relative path
 ├── .env.example       # Template for secrets
 ├── .env               # Secrets (gitignored)
 ├── .gitignore
@@ -97,138 +89,114 @@ mega/
 `bun run index.ts` starts the enabled channels. exe.dev forwards a single public port (8000) at `https://<vmname>.exe.xyz/`. Per-event try/catch around each handler so one bad delivery never tears down the tail.
 
 ### Process Safety
-Claude invocations can hang, spawn long-lived tool subprocesses, or fail silently. The harness protects against runaway processes in five layers + a watchdog:
+Claude invocations can hang, spawn long-lived tool subprocesses, or fail silently. The harness protects against runaway processes in several layers; most of the per-invocation safety now lives in `@fabric/consumer-sdk` (the SDK's `invokeClaude` spawns `claude --print` detached, tree-kills on timeout, and falls back from `--session-id` to `--resume` on first-try failure). Mega-side process-safety:
 
-- **Per-invocation timeout** — every `runClaude` call has a wall-clock deadline (default 5 min, override with `MEGA_INVOKE_TIMEOUT_MS`). On expiry the process is tree-killed (SIGTERM → SIGKILL after 2s grace) and the invocation resolves to `null`.
-- **Process-group tree kill** — each Claude subprocess is spawned with `detached: true` (new process group). `handle.kill()` and the timeout signal the negative PID (`-pgid`), reaching Claude's Node/MCP/tool descendants, not just the top-level `claude` binary.
 - **`make stop` tree-kills the harness group** — `make start` runs the harness under `setsid` so `harness.pid` holds the PGID. `stop` sends `kill -TERM -- -$pgid`, polls, then SIGKILLs stragglers, plus a belt-and-suspenders `pkill -KILL -f "^claude --print"` for orphans from earlier runs.
-- **Bounded `.seen_events` dedup** — `core/invoke.ts` keeps the dedup window capped at `MEGA_MAX_SEEN_EVENTS` (default 10 000). When the cap is exceeded the oldest half is dropped and the file is rewritten; previously the file grew unbounded and was loaded entirely into memory at startup. (Spool itself dedupes inbound publishes server-side via the event `id`; this is a second-layer guard for the consumer's invocation dedup.)
-- **Process-count watchdog** (`core/watchdog.ts`) — every `MEGA_WATCHDOG_INTERVAL_MS` (default 30 s) the harness runs `pgrep -cf "^claude --print"` and warns into `harness.log` if the count exceeds `MEGA_WATCHDOG_THRESHOLD` (default 8). Belt-and-suspenders: catches leaks if every other layer somehow lets one through. Pattern is overridable via `MEGA_WATCHDOG_PATTERN`. The interval timer is `unref()`'d so it never blocks process exit.
-- **Bounded `harness.log`** (`core/log-rotator.ts`) — every `MEGA_LOG_ROTATE_INTERVAL_MS` (default 60 s) the harness checks `harness.log` size and truncates in place if over `MEGA_LOG_MAX_BYTES` (default 10 MB). `make start` redirects with `>>` (O_APPEND) which is load-bearing: the kernel atomically seeks to end-of-file before each write, so an in-place truncate from inside the harness actually frees disk space. With plain `>`, fd 1 keeps its old offset and subsequent writes create a sparse file with the offset as a hole. Side effect of the `>>` change: history now persists across `make start`/`make stop` instead of being truncated on every restart.
+- **In-memory dedup window** — SDK's `BoundedFifoSet` caps the per-channel dedup window at 10 000 ids. Past events are skipped by cursor position (Spool persists `cursor_seq`); the dedup window only catches within-session retries.
+- **Process-count watchdog** (`core/watchdog.ts`) — every `MEGA_WATCHDOG_INTERVAL_MS` (default 30 s) the harness runs `pgrep -cf "^claude --print"` and warns into `harness.log` if the count exceeds `MEGA_WATCHDOG_THRESHOLD` (default 8). Belt-and-suspenders: catches leaks if every other layer lets one through. Pattern is overridable via `MEGA_WATCHDOG_PATTERN`. The interval timer is `unref()`'d so it never blocks process exit.
+- **Bounded `harness.log`** (`core/log-rotator.ts`) — every `MEGA_LOG_ROTATE_INTERVAL_MS` (default 60 s) the harness checks `harness.log` size and truncates in place if over `MEGA_LOG_MAX_BYTES` (default 10 MB). `make start` redirects with `>>` (O_APPEND) — load-bearing: the kernel atomically seeks to end-of-file before each write, so an in-place truncate from inside the harness actually frees disk space.
 
-Stderr from every Claude invocation is inherited (→ `harness.log`) so hangs and errors are visible instead of silently dropped. Every invocation logs `start` / `exit` / `kill` / `timeout` with `session=`, `pid=`, `prompt_bytes=`, `output_bytes=`, and `duration=` fields so operators can correlate harness.log lines back to specific threads when diagnosing a hang.
-
-Testing hooks: `MEGA_CLAUDE_BIN` swaps the binary (defaults to `claude`), used by unit tests to inject `test/mock-claude.sh`, `test/slow-claude.sh`, and `test/tree-claude.sh`. `MEGA_SEEN_EVENTS_PATH` redirects the dedup file to a temp path so tests don't pollute the real `.seen_events`. `core/invoke.ts` exports `__resetSeenEventsForTests` / `__seenEventsCountForTests` / `__isDuplicateForTests` so in-memory state can be inspected and cleared between test cases.
+Stderr from every Claude invocation is inherited (→ `harness.log`) so hangs and errors are visible instead of silently dropped. The SDK's `invokeClaude` logs `start` / `exit` / `kill` / `timeout` with `session=`, `pid=`, `prompt_bytes=`, `output_bytes=`, and `duration=` fields so operators can correlate harness.log lines back to specific threads.
 
 #### Process-safety env vars at a glance
 
 | Var | Default | What it caps |
 |---|---|---|
-| `MEGA_INVOKE_TIMEOUT_MS` | `300000` (5 min) | wall-clock timeout per Claude invocation |
-| `MEGA_MAX_SEEN_EVENTS` | `10000` | dedup window before rotation drops the oldest half |
 | `MEGA_WATCHDOG_INTERVAL_MS` | `30000` | watchdog poll interval |
 | `MEGA_WATCHDOG_THRESHOLD` | `8` | warn when matching process count exceeds this |
 | `MEGA_WATCHDOG_PATTERN` | `^claude --print` | `pgrep -f` pattern for the watchdog |
 | `MEGA_LOG_MAX_BYTES` | `10485760` (10 MB) | rotate `harness.log` when over this size |
 | `MEGA_LOG_ROTATE_INTERVAL_MS` | `60000` | log-rotator poll interval |
 | `MEGA_LOG_PATH` | `<repo>/harness.log` | log file path (test override) |
-| `MEGA_CLAUDE_BIN` | `claude` | path to the Claude binary (test override) |
-| `MEGA_SEEN_EVENTS_PATH` | `<repo>/.seen_events` | dedup file path (test override) |
 | `LINEAR_WEBHOOK_SECRET` | (none) | HMAC-SHA256 signing secret for Linear webhooks |
-| `MEGA_AGENTMAIL_PARENT` | (none) | Spool parent thread name that fabric publishes AgentMail forks into. Gates `startAgentMailV2`. |
-| `SLACK_SIGNING_SECRET` | (none) | Slack app's Signing Secret. Gates the Events API webhook route at `/slack/webhook`. |
-| `MEGA_HTTP_PORT` | `8000` | Shared HTTP server port (Slack + Linear webhook routes). Single public port — exe.dev forwards 8000 by default. |
+| `MEGA_AGENTMAIL_PARENT` | (none) | Spool parent thread name that fabric publishes AgentMail forks into. Gates `startAgentMail`. |
+| `MEGA_SLACK_PARENT` | (none) | Spool parent thread name that fabric publishes Slack forks into. Gates `startSlack`. |
+| `FABRIC_URL` | `https://fabric.delivery` | Base URL for fabric's MCP endpoints (`/mcp/slack-action`, `/mcp/agentmail-action`). |
+| `MEGA_HTTP_PORT` | `8000` | Shared HTTP server port (Linear webhook + /health). Single public port — exe.dev forwards 8000 by default. |
 
 All env vars are parsed via `core/env.ts` (`parsePositiveInt` / `parseNonNegativeInt` / `parseString`) — `0` for a positive-int knob is rejected and falls back to the default rather than silently passing through.
 
 ### How Email Works (fabric-brokered)
 
-Mega no longer receives AgentMail webhooks directly. Fabric (`https://fabric.delivery`) owns the inbound webhook + outbound reply path; Mega is a Spool consumer.
+Fabric (`https://fabric.delivery`) owns inbound webhooks + outbound dispatch. Mega is a Spool consumer that uses `@fabric/consumer-sdk` to wire Claude into the fork loop.
 
 Flow:
 1. Email lands at the configured AgentMail inbox.
-2. AgentMail Svix-signs a webhook to `https://fabric.delivery/agentmail-inbound/webhook/<inbound_connector_id>`.
-3. Fabric verifies the signature against the inbound connector's `svix` credentials slot, derives the email's `thread_id` via `deriveForkKey`, and publishes `ns=agentmail, type=message` into the forked child thread `<MEGA_AGENTMAIL_PARENT>/<thread_id>`. Fabric creates the child thread as a fork of the parent, which emits a `thread.forked` event on the parent.
-4. Mega's `startAgentMailV2(spool, MEGA_AGENTMAIL_PARENT)` tails the parent's discovery cursor (filter `ns=thread, type=forked`) and spawns a per-fork inbound consumer on each child.
-5. The per-fork consumer reads `ns=agentmail, type=message` in lineage mode, invokes Claude with `sessionId = <fork name>`, publishes Claude's response as `ns=message, type=end` back to the same fork.
-6. The fabric outbound supervisor's tail on the outbound connector (with `fork=true` on its binding) picks up the `message.end` and calls `POST /v0/inboxes/{inbox}/messages/{reply_to_message_id}/reply` using the `api` credentials slot (which bundles `api_key` + `inbox_id`).
+2. AgentMail Svix-signs a webhook to `https://fabric.delivery/agentmail-event/webhook/<slug>` (slug-routed, stable across rewires).
+3. Fabric verifies the signature against the event connector's `svix` credentials slot, derives the email's `thread_id` via `deriveForkKey`, and publishes `ns=agentmail, type=message` into the forked child `<MEGA_AGENTMAIL_PARENT>/<thread_id>`. Fabric creates the child thread as a fork of the parent, which emits `thread.forked` on the parent.
+4. The SDK's `startForkedChannel` tails the parent's discovery cursor (filter `ns=thread, type=forked`) and spawns a per-fork consumer for each child.
+5. The per-fork consumer reads `ns=agentmail, type=message` in lineage mode, invokes Claude with `sessionId = <fork name>` and a per-invocation MCP config pointing at `https://fabric.delivery/mcp/agentmail-action`. The config bakes the per-event routing headers (`X-Agentmail-Reply-To-Message-Id`, `X-Agentmail-Thread-Id`) so Claude's tool schemas collapse to `reply({ text })`.
+6. If Claude calls `agentmail-action.reply`, fabric's MCP handler header-merges the routing context into the tool input, validates, and publishes `ns=message, type=end` to the fork.
+7. The action supervisor's per-fork tail on the action binding picks up the `message.end` and dispatches via AgentMail's reply API using the `api` credentials slot.
 
 #### Setup
-Operator-side (one-time, against fabric). The split-connector model means **2 credentials + 2 connectors + 2 bindings** per channel:
+Operator-side (one-time, against fabric). **4 credentials + 4 connectors + 4 bindings** per channel:
 
-1. Create the Svix credentials record (verify-only secret AgentMail signs webhooks with):
+1. Create the Svix credentials record (AgentMail signs webhooks with this):
    ```
-   POST /v1/credentials { type: "agentmail-svix", name: "mega-agentmail",
+   POST /v1/credentials { type: "agentmail-svix", name: "mega-agentmail-svix",
                          config: { webhook_secret: "whsec_…" } }
    ```
-2. Create the API credentials record (replies use this; inbox id bundled with the key):
+2. Create the API credentials record (replies; inbox id bundled with the key):
    ```
-   POST /v1/credentials { type: "agentmail-api", name: "mega-agentmail",
+   POST /v1/credentials { type: "agentmail-api", name: "mega-agentmail-api",
                          config: { api_key, inbox_id } }
    ```
-3. Create the inbound connector and the outbound connector, each referencing the matching credential:
+3. Create the event + action connectors with stable slugs:
    ```
-   POST /v1/connectors { type: "agentmail-inbound",  config: {},
-                         credentials: [{ slot: "svix", credential_id: <id1> }] }
-   POST /v1/connectors { type: "agentmail-outbound", config: {},
-                         credentials: [{ slot: "api",  credential_id: <id2> }] }
+   POST /v1/connectors { type: "agentmail-event",  slug: "mega-agentmail-event",
+                         config: {},
+                         credentials: [{ slot: "svix", credential_id: <svix_id> }] }
+   POST /v1/connectors { type: "agentmail-action", slug: "mega-agentmail-action",
+                         config: {},
+                         credentials: [{ slot: "api",  credential_id: <api_id> }] }
    ```
-4. Create the AgentMail Svix subscription against `https://fabric.delivery/agentmail-inbound/webhook/<inbound_connector_id>`.
-5. Create the Spool parent thread (e.g. `mega/agentmail`) under Mega's client id (`mega@<domain>`); invite fabric's client id (`fabric-prod`) as `writer`.
-6. Create one binding on each connector — both `fork: true`, both `thread: mega/agentmail`:
-   ```
-   POST /v1/connectors/<inbound_id>/bindings  { thread: "mega/agentmail", fork: true }
-   POST /v1/connectors/<outbound_id>/bindings { thread: "mega/agentmail", fork: true }
-   ```
+4. Create the AgentMail Svix subscription against `https://fabric.delivery/agentmail-event/webhook/mega-agentmail-event`.
+5. Create the Spool parent thread (`mega/agentmail`) under Mega's client id (`mega@<domain>`); invite fabric's client id (`fabric-prod`) as `writer`.
+6. Create one binding on each connector — both `fork: true`, both `thread: mega/agentmail`.
 
 Mega-side:
 1. Set `MEGA_AGENTMAIL_PARENT=mega/agentmail` in `.env`.
-2. Restart the harness; `startAgentMailV2` initializes the discovery cursor and waits for forks.
+2. Restart the harness; `startAgentMail` initializes the discovery cursor and waits for forks.
 
 ### How Slack Works (fabric-brokered)
 
-Same shape as AgentMail — Mega doesn't receive Slack webhooks directly. Fabric (`https://fabric.delivery`) handles inbound (signature verify, 🤔 reaction, fork-per-Slack-thread publish) and outbound (`chat.postMessage` + 🤔 cleanup). Mega is a Spool consumer.
+Same shape as AgentMail. Fabric (`https://fabric.delivery`) handles inbound signature verify + fork-per-thread publish; the action supervisor handles outbound dispatch. Mega is a Spool consumer + MCP caller via the SDK.
 
 Flow:
-1. Slack delivers an Events API webhook to `https://fabric.delivery/slack-inbound/webhook/<inbound_connector_id>`.
-2. Fabric verifies the `v0=<hex>` signature against the inbound connector's `signing` credentials slot, handles `url_verification` if present, parses the `event_callback`, fires `reactions.add({channel, ts, name: thinking_face})` fire-and-forget (uses the `bot` slot — skipped if absent or for bot-authored events to prevent loops), and publishes `ns=slack, type=<event.type>` (app_mention, message, etc.) into the forked child thread `<MEGA_SLACK_PARENT>/<channel>-<thread_ts ?? ts>`.
-3. Mega's `startSlackV2(spool, MEGA_SLACK_PARENT)` tails the parent's discovery cursor (filter `ns=thread, type=forked`). Each new fork spawns a per-fork inbound consumer (filter `ns=slack`, no type filter — discriminates in `shouldRespondSlack`).
-4. The per-fork consumer invokes Claude with `sessionId = <fork name>`. Session continuity gives Claude prior turns; no Slack history fetch.
-5. Claude's response is published as `ns=message, type=end` back to the same fork, with `{channel, thread_ts, ts}` carried through.
-6. The fabric outbound supervisor's tail on the outbound connector picks up the `message.end`, calls `chat.postMessage` using the `bot` credentials slot, then `reactions.remove` (best-effort).
-
-`shouldRespondSlack` filter (consumer):
-- `bot_id` / `app_id` / `subtype=bot_message` → skip. Stops the bot from re-invoking on its own replies.
-- `type=app_mention` → respond.
-- `channel_type=im` → respond (DM).
-- `type=message` in a fork Mega has already replied to (`SLACK_REPLIED_FORKS` Set) → respond (follow-up). On consumer spawn, `primeSlackRepliedForks` reads the fork for any prior `ns=message, type=end` event and seeds the set — so restart re-derives state from Spool history instead of forgetting it. Updated live on every successful publish.
-
-`thread_ts ?? ts`: top-level @mentions don't carry `thread_ts` (Slack only sets it on replies-in-threads). Consumer falls back to `ts`, so the outbound reply lands in-thread.
+1. Slack delivers an Events API webhook to `https://fabric.delivery/slack-event/webhook/mega-slack-event`.
+2. Fabric verifies the `v0=<hex>` signature against the event connector's `signing` credentials slot, handles `url_verification` if present, parses the `event_callback`, and publishes `ns=slack, type=<event.type>` (app_mention, message, etc.) into the forked child `<MEGA_SLACK_PARENT>/<channel>-<thread_ts ?? ts>`. **No side effects against Slack** — the thinking-face reaction is now a consumer-side choice.
+3. The SDK's `startForkedChannel` tails the parent's discovery cursor and spawns a per-fork consumer for each `thread.forked` event.
+4. Per event, mega's `shouldConsiderReplySlack` gate filters: skips bot-authored events (loop prevention) and channel chatter mega isn't addressed by; lets through `app_mention`, DMs, and messages in forks mega has previously replied to.
+5. If the gate passes, the SDK invokes Claude with `sessionId = <fork name>` and an MCP config pointing at `https://fabric.delivery/mcp/slack-action`. Per-invocation headers (`X-Slack-Channel`, `X-Slack-Ts`, `X-Slack-Thread-Ts`) auto-fill the tools' routing fields.
+6. Claude composes UX via `slack-action.react({ name })`, `slack-action.post_message({ text })`, and `slack-action.unreact({ name })` — typically reacting `thinking_face` first, posting the reply, then clearing the reaction. Each tool call hops fabric MCP → Spool publish → action-supervisor tail → Slack API.
+7. The replied-state primer marks the fork as "replied" by reading prior `ns=slack, type=post-message` events (via the SDK's `repliedIndicator` config) — restart re-derives state from Spool history instead of forgetting follow-up gating.
 
 #### Setup
-Operator-side (one-time, all calls send `X-Client-Id: mega@<MEGA_DOMAIN>`). The split-connector model means **2 credentials + 2 connectors + 2 bindings** per channel:
+Operator-side (one-time, all calls send `X-Client-Id: mega@<MEGA_DOMAIN>`). **2 credentials + 2 connectors + 2 bindings**:
 
-1. Create the signing credentials record (verify-only secret Slack signs webhooks with):
+1. Create the signing credentials record:
    ```
-   POST /v1/credentials { type: "slack-signing", name: "mega-slack",
+   POST /v1/credentials { type: "slack-signing", name: "mega-slack-signing",
                          config: { signing_secret } }
    ```
-2. Create the bot credentials record (used by `chat.postMessage`, and optionally by the inbound 🤔 reaction):
+2. Create the bot credentials record:
    ```
-   POST /v1/credentials { type: "slack-bot", name: "mega-slack",
+   POST /v1/credentials { type: "slack-bot", name: "mega-slack-bot",
                          config: { bot_token } }
    ```
-3. Create the inbound connector (signing required, bot optional but supply it so the 🤔 ack works) and the outbound connector:
+3. Create the event + action connectors with stable slugs:
    ```
-   POST /v1/connectors { type: "slack-inbound",
-                         config: { thinking_emoji: "thinking_face" },
-                         credentials: [
-                           { slot: "signing", credential_id: <signing_id> },
-                           { slot: "bot",     credential_id: <bot_id> }
-                         ] }
-   POST /v1/connectors { type: "slack-outbound",
-                         config: { thinking_emoji: "thinking_face" },
-                         credentials: [
-                           { slot: "bot", credential_id: <bot_id> }
-                         ] }
+   POST /v1/connectors { type: "slack-event", slug: "mega-slack-event",
+                         config: {},
+                         credentials: [{ slot: "signing", credential_id: <signing_id> }] }
+   POST /v1/connectors { type: "slack-action", slug: "mega-slack-action",
+                         config: {},
+                         credentials: [{ slot: "bot", credential_id: <bot_id> }] }
    ```
-4. Update `slack/manifest.json` `event_subscriptions.request_url` to `https://fabric.delivery/slack-inbound/webhook/<inbound_connector_id>`. Paste manifest into api.slack.com → app → App Manifest → Save Changes → Install/Reinstall App.
-5. Create the Spool parent thread (e.g. `slack/<bot_user_id>`) under Mega's `X-Client-Id`; invite `fabric-prod` as `writer`.
-6. Create one binding on each connector — both `fork: true`, both `thread: slack/<bot_user_id>`:
-   ```
-   POST /v1/connectors/<inbound_id>/bindings  { thread: "slack/<bot_user_id>", fork: true }
-   POST /v1/connectors/<outbound_id>/bindings { thread: "slack/<bot_user_id>", fork: true }
-   ```
+4. Update `slack/manifest.json` `event_subscriptions.request_url` to `https://fabric.delivery/slack-event/webhook/mega-slack-event`. Paste into api.slack.com → App Manifest → Save → Reinstall App.
+5. Create the Spool parent thread (`slack/<bot_user_id>`) under Mega's `X-Client-Id`; invite `fabric-prod` as `writer`.
+6. Create one binding on each connector — both `fork: true`, both `thread: slack/<bot_user_id>`.
 
 Mega-side:
 1. Set `MEGA_SLACK_PARENT=slack/<bot_user_id>` in `.env`.
@@ -258,9 +226,9 @@ Haakam's Slack user ID: `U08TMCS2KRT`, DM channel: `D0AS9T5CP4K`. Mega's bot_use
 
 ### Testing
 - `make test` — run all tests (unit + E2E)
-- `make test-unit` — unit tests only (invoke + tree-kill + interval + log-rotator + watchdog + Slack/AgentMail/Linear webhook signature verify + Slack intake helpers)
-- `make test-e2e` — E2E tests (requires harness running via `make start`; AgentMail e2e auto-skips if `AGENTMAIL_API_KEY` is blank)
-- Tests use Bun's built-in test runner (`bun test`). Integration tests inject mock binaries via `MEGA_CLAUDE_BIN`.
+- `make test-unit` — unit tests only (env + interval + log-rotator + watchdog + spool-loop helpers + Linear HMAC). Fabric-side coverage lives in the fabric repo's own `bun test`.
+- `make test-e2e` — E2E tests (requires harness running via `make start`)
+- Tests use Bun's built-in test runner (`bun test`).
 
 ## Rules
 
