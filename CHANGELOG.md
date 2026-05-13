@@ -2,6 +2,43 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-05-13 (session 6) — read_thread forward-walk + agentmail ns migration + tool-only agent surface
+
+Iteration on session 5's read_thread + nested-fork work, ending at a cleaner contract: fabric's entire agent-facing surface is MCP tool descriptions + responses. No SDK-injected prompt content.
+
+**read_thread reshape: forward-walk semantics**
+- Input: `from_seq?` (default → tail, via Spool's `last=K`). Output: `entries[]` (each with `seq`) + `next_seq?` (forward continuation cursor matching Spool's existing API).
+- Dropped the mixed `before_seq` + `include_ancestry` surface. Backward pagination is no longer a separate concept — to walk older history, the agent picks any seq below the current window's lowest and passes it as `from_seq`. Crossing into ancestor threads (Slack: channel-level events that existed before the per-thread fork) happens automatically when `from_seq` drops below `seq_offset`.
+- `next_seq` now only set when the agent walks forward from an explicit `from_seq` AND the page was full — tail mode never advertises it (nothing past head).
+- `TranscriptEntry.seq` field added so the agent has anchors to pass back.
+
+**Tool-only agent surface**
+- Removed `seqPreamble` from the consumer-sdk. The SDK no longer mutates tenant prompts — it's purely a Spool→Claude transport.
+- The `read_thread` tool description does the work the preamble was doing: explicit "reach for this proactively on cold resumes or long-running threads" framing.
+- Principle: fabric provides tools (descriptions + structured responses). Everything else — system prompt, per-event prompt body, framing — belongs to the tenant.
+
+**agentmail-action namespace migration**
+- Migrated from legacy `ns=message, type=end` to `ns=agentmail, type=reply` for symmetry with slack-action's pattern. Both connectors now use `ns=<provider>` uniformly.
+- Lets `historyNs` work for both (Slack and agentmail each have a single canonical ns).
+
+**`historyNs` on EventConnectorType**
+- New field per connector type. read_thread passes it to Spool as the ns filter so bookkeeping (`thread.forked`, `consumer.*`) doesn't eat the page. Spool's adaptive widening fetches more raw events as needed; agent reliably gets up to `limit` formatted entries.
+
+**Constants centralized**
+- `SLACK_NS` + `SLACK_EVENT_TYPES` in `slack/shared.ts`; `AGENTMAIL_NS` + `AGENTMAIL_EVENT_TYPES` in `agentmail/shared.ts`. Used across formatter, dispatcher, toEvent, filter. TS catches typos that previously would only surface as silent dispatch / format mismatches.
+
+**SDK polish**
+- `repliedIndicator` is truly optional — dropped the `DEFAULT_REPLIED_INDICATOR = {ns:"message",type:"end"}` fallback (obsolete after the agentmail migration). Tenants that don't gate on `hasReplied` can omit entirely.
+- `readEventsPage` gains `last?: number` parity with fabric's server-side client. `latestSeq` now uses `last=1` (one call returns head+1) instead of paginate-until-empty with a 10-iteration safety bound.
+- Tail loops in both supervisor + consumer-sdk reconnect after transient SSE drops with capped (60s) exponential backoff + ±20% jitter.
+
+**Simplify passes**
+- `MAX_READ_THREAD_LIMIT` runtime clamp removed — Zod schema's `.max(500)` is the single source of truth.
+- Test helper `fakeEvent({seq, ns, type, data, ...})` in `test/integration/helpers.ts` collapses the 7-field event-shape literals previously duplicated at 6 sites.
+- Nested-fork test setup helper `nestedSlackFork(binding, channelId, ts)` consolidates the topology setup across ancestry tests.
+
+Acceptance: 273 fabric / 5 consumer-sdk tests green. Fabric prod deployed; mega restarted on the local-file SDK dep. End-to-end @mention + thread-reply working.
+
 ## 2026-05-12 (session 5) — read_thread + seq awareness + channel-as-parent forks
 
 Two big themes on top of session 4's MCP/SDK split.
