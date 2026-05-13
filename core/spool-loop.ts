@@ -213,6 +213,11 @@ export async function startAgentMail(spool: SpoolClient, parent: string): Promis
     cursors: AGENTMAIL_CURSORS,
     inboundFilter: { ns: "agentmail" },
     shouldRespond: () => true,
+    // shouldRespond doesn't gate on hasReplied so the indicator is
+    // largely decorative for agentmail, but keep it set to the action
+    // emission so read_thread's eager-replied path is consistent with
+    // slack's.
+    repliedIndicator: { ns: "agentmail", type: "reply" },
     buildPrompt: buildAgentMailPrompt,
     systemPrompt: AGENTMAIL_SYSTEM_PROMPT,
     mcpServers: ({ fork, event }) => {
