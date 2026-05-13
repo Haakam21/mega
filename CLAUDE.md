@@ -170,7 +170,7 @@ slack/<bot>                              ← binding parent
     └── slack/<bot>/<channel>/<ts>       ← per-thread fork (thread replies land here)
 ```
 
-Top-level channel messages publish into the **channel thread**; thread replies publish into the **per-thread leaf fork** (lazy-created at first reply). When the agent replies to a thread message, `read_thread` returns the leaf's events by default; passing `include_ancestry: true` folds in every channel-level message that existed before the thread started — Spool's `include_ancestry` flag gives that whole chronicle in one contiguous events array, sorted by absolute seq, with the same ns/type filter applied at every level. The SDK's `[fabric: event seq=N]` prompt preamble surfaces the absolute lineage position so the agent knows when there's prior context worth fetching.
+Top-level channel messages publish into the **channel thread**; thread replies publish into the **per-thread leaf fork** (lazy-created at first reply). When the agent replies to a thread message, `read_thread()` returns the leaf's most recent events (tail). To rewind into older context — the parent message and prior channel chatter — the agent passes a lower `from_seq`; once it drops below the leaf's `seq_offset`, Spool's chain walker transparently surfaces ancestor-thread events. Each transcript entry exposes its `seq`, so the agent has anchors to pass back. The SDK's `[fabric: event seq=N]` prompt preamble surfaces the agent's absolute lineage position so the agent knows when there's prior context worth fetching.
 
 Flow:
 1. Slack delivers an Events API webhook to `https://fabric.delivery/slack-event/webhook/mega-slack-event`.
