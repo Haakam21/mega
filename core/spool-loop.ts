@@ -100,6 +100,22 @@ const SESSIONS_CURSORS = {
 const FABRIC_URL = process.env.FABRIC_URL ?? "https://fabric.delivery";
 const CLIENT_ID = `mega@${process.env.MEGA_DOMAIN ?? "india-desert.exe.xyz"}`;
 
+// Slack bot's own user id — needed to detect @mentions in plain `message`
+// events (their text contains `<@<bot_id>>`). Slack delivers an @mention as
+// TWO events with the same (channel, ts): `app_mention` AND `message.channels`.
+// slackDedupId collapses them into one Claude turn, but the gate must accept
+// EITHER delivery — whichever arrives first wins.
+const BOT_USER_ID = (() => {
+  const fromEnv = process.env.MEGA_SLACK_BOT_USER_ID;
+  if (fromEnv) return fromEnv;
+  const parent = process.env.MEGA_SLACK_PARENT;
+  if (parent) {
+    const seg = parent.split("/").pop();
+    if (seg) return seg;
+  }
+  return null;
+})();
+
 /** Slack delivers @mentions as both `app_mention` and `message.channels`
  *  with distinct envelope event_ids. Key dedup on the inner (channel, ts)
  *  pair so we fire Claude once per Slack message. */
@@ -131,6 +147,16 @@ function shouldConsiderReplySlack(
 
   if (d.type === "app_mention") return true;
   if (d.channel_type === "im") return true;
+  // Channel @mention: Slack also delivers the same logical message as
+  // `message.channels` (d.type === "message") with text containing
+  // `<@<bot_id>>`. Accept it so dedup-order (app_mention vs message.channels
+  // arrival) doesn't drop the turn on a fresh fork where hasReplied=false.
+  if (d.type === "message" && BOT_USER_ID) {
+    const text = typeof (d as { text?: unknown }).text === "string"
+      ? ((d as { text: string }).text)
+      : "";
+    if (text.includes(`<@${BOT_USER_ID}>`)) return true;
+  }
   if (d.type === "message" && ctx.hasReplied()) return true;
   return false;
 }
