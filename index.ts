@@ -1,7 +1,7 @@
 import { startWatchdog } from "./core/watchdog";
 import { startLogRotator } from "./core/log-rotator";
 import { SpoolClient } from "./fabric/packages/consumer-sdk/src";
-import { startAgentMail, startSlack } from "./core/spool-loop";
+import { startAgentMail, startSessions, startSlack } from "./core/spool-loop";
 import { routes as linearWebhookRoutes } from "./linear/spool-relay";
 import { startHttpServer, type RouteHandler } from "./core/http-server";
 
@@ -32,6 +32,16 @@ const slackParent = process.env.MEGA_SLACK_PARENT;
 if (slackParent) {
   void startSlack(spool, slackParent);
   channels.push("slack");
+}
+
+// Session-routed multi-channel consumer. One Claude session per session
+// fork — events from any provider that route to the same session land
+// in chronological order. Requires fabric-side bindings configured with
+// use_sessions=true; see startSessions for setup details.
+const sessionsParent = process.env.MEGA_SESSIONS_PARENT;
+if (sessionsParent) {
+  void startSessions(spool, sessionsParent);
+  channels.push("sessions");
 }
 
 if (process.env.LINEAR_WEBHOOK_SECRET) {
