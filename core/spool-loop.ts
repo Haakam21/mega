@@ -17,6 +17,41 @@ import {
   startForkedChannel,
   type SpoolEvent,
 } from "../fabric/packages/consumer-sdk/src";
+import {
+  AGENTMAIL_EVENT_TYPES,
+  AGENTMAIL_NS,
+} from "../fabric/src/connectors/agentmail/shared";
+import {
+  SLACK_EVENT_TYPES,
+  SLACK_NS,
+} from "../fabric/src/connectors/slack/shared";
+
+const SESSIONS_SYSTEM_PROMPT =
+  "You are responding in a session — a single conversation that can " +
+  "span multiple channels (Slack, email, …). Each turn's prompt tells " +
+  "you which channel the latest event came from and what the routing " +
+  "context is.\n\n" +
+  "Tools from every action connector are wired in every turn:\n" +
+  "  • slack-action__post_message({ channel, text, thread_ts? }) — post a " +
+  "Slack message. To respond to the channel/thread the latest event came " +
+  "from, the channel/thread_ts headers are pre-filled.\n" +
+  "  • slack-action__update_message, slack-action__react, slack-action__unreact.\n" +
+  "  • agentmail-action__reply({ text }) — reply within the current email " +
+  "thread (only works when the latest event was an email; routing " +
+  "headers are pre-filled).\n" +
+  "  • agentmail-action__send_message({ to, subject, text }) — start a " +
+  "fresh email thread to any recipients. Use this to bridge a Slack " +
+  "conversation into email: the email's reply will fold back into this " +
+  "same session automatically.\n" +
+  "  • read_thread() — read the session's full event history " +
+  "(interleaves events from every provider chronologically).\n" +
+  "  • link({ connector_type, key }) — explicitly fold an existing " +
+  "provider-thread into the current session.\n" +
+  "  • fork_session({ reason? }) — spawn a sub-session that shouldn't " +
+  "share memory with this one.\n\n" +
+  "If the latest event doesn't warrant a reply (bot chatter, side " +
+  "conversations between other people), end your turn without calling " +
+  "any tool.";
 
 const AGENTMAIL_SYSTEM_PROMPT =
   "You are responding via email. If the email warrants a reply, call " +
@@ -55,6 +90,11 @@ const SLACK_CURSORS = {
 const AGENTMAIL_CURSORS = {
   discovery: "mega-agentmail-discovery-v8",
   inbound: "mega-agentmail-inbound-v8",
+} as const;
+
+const SESSIONS_CURSORS = {
+  discovery: "mega-sessions-discovery-v1",
+  inbound: "mega-sessions-inbound-v1",
 } as const;
 
 const FABRIC_URL = process.env.FABRIC_URL ?? "https://fabric.delivery";
@@ -203,6 +243,126 @@ export async function startSlack(spool: SpoolClient, parent: string): Promise<vo
       });
     },
   });
+}
+
+/** Session-routed consumer.
+ *
+ *  Sessions are direct children of `parent` (e.g. `mega/sessions`).
+ *  Inbound events on a session can come from any provider — fabric's
+ *  dispatcher routes via `session_routes` so a Slack thread and the
+ *  email it spawned land in the same session fork chronologically.
+ *
+ *  Every turn wires BOTH slack-action and agentmail-action MCPs.
+ *  Per-event provider headers populate the originating channel's MCP
+ *  fully; the other gets just framework headers (X-Client-Id +
+ *  X-Fabric-Fork), exposing only its "start-a-new-conversation" tools
+ *  (`agentmail-action.send_message`, or `slack-action.post_message`
+ *  with an explicit `channel`).
+ *
+ *  Operator setup: create a `parent` Spool thread, then add four
+ *  bindings on fabric (slack-event, slack-action, agentmail-event,
+ *  agentmail-action), all with `thread: parent, fork: true,
+ *  use_sessions: true`. */
+export async function startSessions(spool: SpoolClient, parent: string): Promise<void> {
+  return startForkedChannel({
+    spool,
+    parent,
+    label: "sessions",
+    cursors: SESSIONS_CURSORS,
+    // Sessions are direct children of parent — one Claude session per
+    // session fork.
+    depth: 1,
+    // Multi-provider: events come in under ns=slack or ns=agentmail.
+    // No Spool-level filter — gating happens in shouldRespond.
+    inboundFilter: {},
+    shouldRespond: shouldConsiderReplySession,
+    dedupId: sessionDedupId,
+    buildPrompt: buildSessionPrompt,
+    systemPrompt: SESSIONS_SYSTEM_PROMPT,
+    sessionIdFor: (_ev, { fork }) => fork,
+    // Track outputs from either action — used by the loop-prevention path.
+    repliedIndicator: { ns: "slack", type: "post-message" },
+    mcpServers: ({ fork, event }) => {
+      const d = event.data as Record<string, unknown>;
+      // Slack-action: full headers when this event came from Slack, just
+      // X-Fabric-Fork otherwise. Agent can still call post_message with
+      // an explicit `channel` from any session.
+      const slackHeaders =
+        event.ns === SLACK_NS
+          ? {
+              "X-Slack-Channel": typeof d.channel === "string" ? d.channel : undefined,
+              "X-Slack-Ts": typeof d.ts === "string" ? d.ts : undefined,
+              "X-Slack-Thread-Ts":
+                typeof d.thread_ts === "string"
+                  ? d.thread_ts
+                  : typeof d.ts === "string"
+                    ? d.ts
+                    : undefined,
+            }
+          : {};
+      const agentmailHeaders =
+        event.ns === AGENTMAIL_NS
+          ? {
+              "X-Agentmail-Reply-To-Message-Id":
+                typeof d.message_id === "string" ? d.message_id : undefined,
+              "X-Agentmail-Thread-Id":
+                typeof d.thread_id === "string" ? d.thread_id : undefined,
+            }
+          : {};
+      return {
+        ...mcpServer("slack-action", fork, slackHeaders),
+        ...mcpServer("agentmail-action", fork, agentmailHeaders),
+      };
+    },
+  });
+}
+
+// Per-ns sets of agent-authored event types we must never echo back as
+// input — recursing on our own output would loop the conversation.
+const SLACK_AGENT_OUTPUTS = new Set<string>([
+  SLACK_EVENT_TYPES.POST_MESSAGE,
+  SLACK_EVENT_TYPES.UPDATE_MESSAGE,
+  SLACK_EVENT_TYPES.REACTION_ADD,
+  SLACK_EVENT_TYPES.REACTION_REMOVE,
+]);
+const AGENTMAIL_AGENT_OUTPUTS = new Set<string>([
+  AGENTMAIL_EVENT_TYPES.REPLY,
+  AGENTMAIL_EVENT_TYPES.SEND_MESSAGE,
+]);
+
+function shouldConsiderReplySession(
+  ev: SpoolEvent,
+  ctx: { hasReplied: () => boolean },
+): boolean {
+  if (ev.ns === "thread" || ev.ns === "consumer") return false;
+  if (ev.ns === SLACK_NS) {
+    if (SLACK_AGENT_OUTPUTS.has(ev.type)) return false;
+    return shouldConsiderReplySlack(ev, ctx);
+  }
+  if (ev.ns === AGENTMAIL_NS) {
+    if (AGENTMAIL_AGENT_OUTPUTS.has(ev.type)) return false;
+    return true;
+  }
+  return false;
+}
+
+function sessionDedupId(ev: SpoolEvent): string {
+  if (ev.ns === SLACK_NS) return slackDedupId(ev);
+  if (ev.ns === AGENTMAIL_NS) {
+    const eventId = ev.data?.event_id as string | undefined;
+    if (eventId) return `agentmail:${eventId}`;
+  }
+  return ev.id || `spool-seq-${ev.seq}`;
+}
+
+function buildSessionPrompt(ev: SpoolEvent): string {
+  if (ev.ns === SLACK_NS) {
+    return `New Slack event in this session:\n\n${buildSlackPrompt(ev)}`;
+  }
+  if (ev.ns === AGENTMAIL_NS) {
+    return `New AgentMail event in this session:\n\n${buildAgentMailPrompt(ev)}`;
+  }
+  return `New ${ev.ns}/${ev.type} event in this session:\n\n${JSON.stringify(ev.data, null, 2)}`;
 }
 
 export async function startAgentMail(spool: SpoolClient, parent: string): Promise<void> {
