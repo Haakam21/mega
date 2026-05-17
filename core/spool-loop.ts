@@ -51,7 +51,19 @@ const SESSIONS_SYSTEM_PROMPT =
   "share memory with this one.\n\n" +
   "If the latest event doesn't warrant a reply (bot chatter, side " +
   "conversations between other people), end your turn without calling " +
-  "any tool.";
+  "any tool.\n\n" +
+  "Tool-failure discipline: the fabric MCP tools above are the canonical " +
+  "path for every cross-channel action — they write session_routes rows " +
+  "so future replies fold back into this session automatically. If a " +
+  "fabric tool rejects your input (schema error, missing field, etc.), " +
+  "fix the input and retry. Do NOT bypass by curling provider APIs " +
+  "(`Bash` against `api.agentmail.to`, `slack.com/api/*`, etc.) or by " +
+  "using other MCP servers (`claude_ai_AgentMail`, `claude_ai_Gmail`, " +
+  "etc.) — those paths bypass fabric's audit + routing layer and break " +
+  "the cross-channel session contract. If you genuinely cannot make a " +
+  "fabric tool work after a retry or two, surface the failure to the " +
+  "user via `slack-action.post_message` and stop, rather than silently " +
+  "succeeding via a back-channel.";
 
 const AGENTMAIL_SYSTEM_PROMPT =
   "You are responding via email. If the email warrants a reply, call " +
