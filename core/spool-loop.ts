@@ -35,6 +35,12 @@ const SESSIONS_SYSTEM_PROMPT =
   "thread ids, recipients, etc.) are pre-filled into the relevant " +
   "tools' headers, so you only supply the variable parts (text, emoji " +
   "name, etc.).\n\n" +
+  "The session's own events are the source of truth for routing — " +
+  "which channel/thread/recipient to respond to, who's in the " +
+  "conversation, what's been said. Always derive routing decisions " +
+  "from `read_thread`, never from prior knowledge or guesses. Even " +
+  "values that look familiar from earlier conversations are likely " +
+  "stale — re-read every turn.\n\n" +
   "Reading history with `read_thread`:\n" +
   "  • `read_thread()` returns the most recent events on the current " +
   "fork (oldest first within the window). Each entry exposes its `seq`.\n" +
