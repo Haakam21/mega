@@ -307,9 +307,12 @@ export async function startSessions(spool: SpoolClient, parent: string): Promise
     parent,
     label: "sessions",
     cursors: SESSIONS_CURSORS,
-    // Sessions are direct children of parent — one Claude session per
-    // session fork.
-    depth: 1,
+    // Depth 2: sessions at depth=1, per-agent-spawned-conversation
+    // sub-forks at depth=2. Each gets its own Claude session — parent
+    // session for the original convo, sub-fork sessions for each side
+    // conversation the parent agent kicks off (emails, cross-channel
+    // posts). Fabric's session-routed supervisor mirrors this depth.
+    depth: 2,
     // Multi-provider: events come in under ns=slack or ns=agentmail.
     // No Spool-level filter — gating happens in shouldRespond.
     inboundFilter: {},
