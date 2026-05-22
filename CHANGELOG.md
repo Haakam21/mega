@@ -2,6 +2,22 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-05-22 (session 9) — rename session-tools → thread-tools (fabric#23)
+
+Vocabulary cleanup. The MCP session-control tools operated on Spool threads (the `into` arg is literally a thread name) and sat next to `read_thread`, so the "session" naming was an unnecessary layer the agent had to translate through.
+
+**Renamed (wire + symbols), fabric#23:**
+- `join_session` → `join_thread`
+- `fork_session` → `fork_thread`
+- `list_sessions` → `list_threads`
+- Response fields on `link` + `fork_thread`: `session_thread` → `thread`, `previous_session` → `previous_thread`. `list_threads` returns `{threads: […]}` (was `{sessions: …}`).
+
+**Kept "session" (fabric-internal routing layer, not agent-facing):** `session_routes` table + repo, `use_sessions` binding flag, mega's `SESSIONS_*` consts in `core/spool-loop.ts`.
+
+**Mega side:** no code change — Claude discovers tool names from the MCP catalog at invocation time. Only `CLAUDE.md` prose updated (`join_session` → `join_thread`).
+
+**Deploy**: PR #23 merged → staging (1m21s) → prod (1m30s), a8f184f. Verified prod `tools/list` returns the new names (ECS rolling deploy took ~1min to fully propagate). Mega restarted (PGID 2071843). 344 fabric+SDK tests pass, typecheck clean.
+
 ## 2026-05-22 (session 8) — join_session cleanup: routes rewrite + consumer self-teardown
 
 Two follow-ups to fabric#17's `join_session` that close the "join leaves dead source state" gap. Root-caused via the missed-reply incident logged in `memories/topics/join_session_merge_boundary_dropped_message.md` — turned out to be both a Mega prompt issue (clone produced text without calling `post_message`) and a consumer race after the join.
