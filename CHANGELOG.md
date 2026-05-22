@@ -2,6 +2,27 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-05-22 (session 10) — join teardown via thread metadata, not the join marker (fabric#25)
+
+End-to-end testing of `join_thread` (wire test against prod) found the consumer-side join-teardown from fabric#21 **didn't actually fire for new joins**. It keyed off a `ns=thread, type=joined` event, but Spool doesn't reliably surface that marker to a source-thread cursor.
+
+**What the e2e test proved (with three throwaway `mega/sessions/jointest*` thread pairs):**
+- `join_thread` MCP + route rewrite + Spool terminal redirect all work (publish to source physically lands on target; `routes_rewritten:1`).
+- A **live SSE tail across a join goes silent** — no marker frame, no auto-follow into the target.
+- **Backfill from at/after the join seq skips the marker** and jumps straight into the terminal's events → source consumer double-tails (dedup-guarded, but a real split-brain race since `sessionIdFor` returns the source fork).
+- Freshly-joined sources have **no queryable `thread.joined`** at all on current Spool — only an older legacy join (`06157f45`) had one. So `wasJoined`'s event probe missed every join I made today, and the in-stream marker check was dead code.
+
+**Fix (fabric#25):** detect joins from authoritative thread metadata.
+- `SpoolClient.getThreadInfo(name)` → `{terminal_thread, joined_into, …}`.
+- `wasJoined` checks `terminal_thread !== fork` (one `GET /threads/{name}`), not an event.
+- Check runs at the **top of every (re)tail iteration** — covers startup (restart finds an already-joined fork) AND the live-join case (the silent tail's next reconnect would otherwise backfill across the boundary). Dropped the dead in-stream branch + `JOINED_TYPE` const + the separate spawn-time check (loop-top subsumes it).
+
+**Deploy + verify:** PR #25 → prod (75db769, 1m21s, `/health` 200). Mega restarted (PGID 3081759). **All four joined sources tore down** (`06157f45` + 3× `jointest*-src`) — vs. the old check which only caught the one legacy marker. 344 fabric + 19 consumer-sdk tests pass.
+
+**By-design residual:** a join while mega runs tears down on the source consumer's *next reconnect*, not instantly. The silent-tail window between join and reconnect is benign (no double-processing while silent; routes already point at target).
+
+**Cleanup TODO:** the `mega/sessions/jointest{,2,3}-*` test threads are now junk under the sessions parent (joined/abandoned). Harmless but noise in `list_threads`. Delete if Spool grows a thread-delete, or leave to age out.
+
 ## 2026-05-22 (session 9) — rename session-tools → thread-tools (fabric#23)
 
 Vocabulary cleanup. The MCP session-control tools operated on Spool threads (the `into` arg is literally a thread name) and sat next to `read_thread`, so the "session" naming was an unnecessary layer the agent had to translate through.
