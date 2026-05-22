@@ -18,6 +18,12 @@ Vocabulary cleanup. The MCP session-control tools operated on Spool threads (the
 
 **Deploy**: PR #23 merged → staging (1m21s) → prod (1m30s), a8f184f. Verified prod `tools/list` returns the new names (ECS rolling deploy took ~1min to fully propagate). Mega restarted (PGID 2071843). 344 fabric+SDK tests pass, typecheck clean.
 
+**`fabric#24` — simplify-pass cleanup of the rename.** Three consistency gaps the review caught:
+- Handler fn `linkSession` → `linkThread` (matches `forkThread`/`joinThread`/`listThreads`; the `link` tool name itself is unchanged).
+- `registry.ts` comment "session-control tools" → "thread-control".
+- `link` tool's `key` param description: "current session" → "current thread".
+Behaviorally inert (internal symbol + comments + one tool-description text tweak). Merged → prod (1m15s). Skipped: converting test string literals to `*_TOOL_NAME` constants (the `tools/list` assertion is an intentional hardcoded snapshot).
+
 ## 2026-05-22 (session 8) — join_session cleanup: routes rewrite + consumer self-teardown
 
 Two follow-ups to fabric#17's `join_session` that close the "join leaves dead source state" gap. Root-caused via the missed-reply incident logged in `memories/topics/join_session_merge_boundary_dropped_message.md` — turned out to be both a Mega prompt issue (clone produced text without calling `post_message`) and a consumer race after the join.
