@@ -2,6 +2,64 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-05-22 (session 8) — join_session cleanup: routes rewrite + consumer self-teardown
+
+Two follow-ups to fabric#17's `join_session` that close the "join leaves dead source state" gap. Root-caused via the missed-reply incident logged in `memories/topics/join_session_merge_boundary_dropped_message.md` — turned out to be both a Mega prompt issue (clone produced text without calling `post_message`) and a consumer race after the join.
+
+**`fabric#21` — routes rewrite on join + consumer self-teardown**
+- `src/repos/session-routes.ts::rewriteRoutesForSession(tenantClientId, from, to)` — single tenant-scoped UPDATE on the existing `session_routes_by_session` index.
+- `src/mcp/handler.ts::joinSession` — after `client.joinThread` succeeds, repoints every route pointing at the source to the target. Best-effort: rewrite failure logs but doesn't fail the join (Spool's `terminal_thread` keeps inbound dispatch correct either way). Response now includes `routes_rewritten: N`.
+- `packages/consumer-sdk/src/fork-channel.ts`:
+  - `wasJoined(spool, fork)` predicate at the top of `spawnForkConsumer` — bails early on restart when the cursor's persisted position may already be past the `thread.joined` marker.
+  - In-stream check inside the cursor's for-await loop catches live joins: first `ns=thread, type=joined` event acks past itself and exits the consumer. The target's consumer owns the stream from there.
+- 3 new integration tests (rewrite happy path + tenant scoping + the existing test updated to assert `routes_rewritten: 0`).
+
+**`fabric#22` — simplify pass**
+- Extracted shared `hasEventMatching(spool, fork, {ns, type}, label)` — `wasJoined` and `markRepliedIfPresent` had identical try-read-warn-default shapes; both now wrap one helper.
+- Dropped `stopped` boolean in the cursor for-await loop; `return` directly. The reconnect-on-error retry path was wrong for a clean teardown.
+- Moved `upsertSessionRoute` from in-test `await import` calls to a top-level static import.
+
+**Deploy**: PR #21 merged → staging → prod (06:53Z). PR #22 merged → staging → prod (07:51Z). Mega restarted (PGID 2032712). First post-deploy spawn confirmed:
+```
+spawned at depth=1 for mega/sessions/06157f45-67a0-40d1-a197-ca1469fb4901
+discovery cursor=cur_04…
+skipping joined fork=mega/sessions/06157f45-67a0-40d1-a197-ca1469fb4901 (terminal redirect handles inbound)
+```
+
+**Net delta**: 209 fabric tests + 19 consumer-sdk tests pass post-simplify. Both typecheck clean. No env vars added.
+
+**Followups still open** (see `memories/topics/next-up-join-followups.md`):
+- Cross-task `JoinNotice` delivery (only matters under spool model 3, not deployed today).
+- Mega-side prompt tightening — actually validated in this session that the clone reaches for `join_session` on its own. But it forgot to call `post_message` for one turn — `SESSIONS_SYSTEM_PROMPT` may need a "to reply to a Slack event, call slack-action__post_message; plain text output is invisible to the user" directive. Not shipped this session.
+
+## 2026-05-13 (session 7) — interrupt-on-arrival inbound pipeline
+
+Reliability work inspired by photon's inbound-pipeline best-practices doc. Without debouncing — Haakam's call, no fixed pre-response delay — but with the photon-style mid-generation cancellation: a new accepted event arriving during an in-flight Claude turn tree-kills the subprocess and re-fires immediately with the carried batch.
+
+**`@fabric/consumer-sdk`**
+- New `ForkConsumer` state machine (`packages/consumer-sdk/src/fork-consumer.ts`). Two states: `idle` and `flushing`. Idle + accepted event → fire `invokeClaude` immediately. Flushing + accepted event → `AbortController.abort()` + queue in pending. On invoke completion: aborted → carry `[...batch, ...pending]` into a fresh flush; not-aborted → ack `max(batch.seq)+1` and consume pending. Filtered events ack inline in idle, ride along in batch seq range during flushing.
+- `invokeClaude` learned `opts.signal: AbortSignal`. On abort: tree-kill (SIGTERM, then SIGKILL after 2s grace), resolve with `aborted: true`. Pre-aborted signal short-circuits without spawning. `InvokeResult.aborted: boolean` added so callers can distinguish "user interrupted, carry forward" from "Claude failed, ack and move on."
+- Cursor `for await` in `spawnForkConsumer` no longer awaits per-event work — `consumer.onArrival(ev)` is synchronous state mutation that may kick off async invokes in the background. The SSE keeps streaming during a flush, so new arrivals can interrupt.
+- Batched prompt: `accepted.map(buildPrompt).join("\n\n---\n\n")`. Routing context (`mcpServers({fork, event})`) + `sessionIdFor` resolve against the *latest* accepted event so reactions/reply-to land on the user's most recent message.
+- New tests: `test/fork-consumer.test.ts` (11 state-machine cases), `test/invoke-abort.test.ts` (signal propagation via a fake-claude shell script). Plus the existing dedup tests still pass — 18 SDK tests total.
+
+**Behavior change visible in `harness.log`**
+- New log lines: `flush fork=… accepted=N ok=… aborted=…` per turn; `aborted fork=… carried=N` on every re-fire.
+- Removed: the per-event `seq=… ok=…` line — now batched into one `flush` line per accepted turn.
+
+No mega-side code changes — the SDK's new behavior takes effect automatically. No new env vars. No backward-compat shims (the `processEvent` function is gone, not deprecated).
+
+**Simplify pass (same session, after `/simplify`)**
+- Dropped redundant `state.aborted: boolean` on the flushing state — `AbortController.abort()` is idempotent so the guard added nothing.
+- Deleted unreachable `accepted.length === 0` branch in `runFlush` — every call site (idle→flush, post-success refire, abort-carry) guarantees at least one accepted event.
+- Removed the `currentState` getter and its `index.ts` re-export — leaky test-only API; tests now assert via observable behavior (`rec.acks`, `rec.invokes`, `rec.successes`).
+- Extracted `consumePending` helper to flatten `onInvokeDone`'s nested branching.
+- `invoke.ts`: extracted `killWithGrace(proc)` to dedup the SIGTERM+SIGKILL escalation across the timeout and abort paths. `killTimer` is now held in a local and cleared in `settle()` so a fast SIGTERM-respecting child doesn't waste a 2s timer (also `.unref()`'d for safety). Hoisted the pre-abort short-circuit above the `mkdtempSync`/`writeFileSync` cost in `invokeClaude` proper.
+- Shared `test/_fake-claude.ts` helper — both `invoke-abort.test.ts` and `burst.test.ts` use `makeFakeClaude({sleepSec, prefix})` instead of duplicate beforeAll/afterAll blocks.
+- Burst test now uses a 5s fake-claude (was 30s) and asserts the third invocation finishes naturally — no more relying on test-runner tree-kill to clean up a 30s sleeper.
+- Trimmed narrative comments in `fork-consumer.ts` (16-line top-of-file design doc + per-field State doc strings); kept only the load-bearing WHY comments.
+- Net delta after simplify pass: 19 SDK tests pass, 296 fabric tests pass, both typecheck clean.
+
 ## 2026-05-13 (session 6) — read_thread forward-walk + agentmail ns migration + tool-only agent surface
 
 Iteration on session 5's read_thread + nested-fork work, ending at a cleaner contract: fabric's entire agent-facing surface is MCP tool descriptions + responses. No SDK-injected prompt content.
