@@ -2,6 +2,25 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-05-23 (session 11) — kill the S2 read-spike on restart (fabric#26 + #27, spool#9)
+
+The S2 founder flagged abnormal read usage again (first time was 2026-05-14, the 416-polling issue — different cause). Verified via the S2 metrics API: spool-prod unary read-ops spiked from a ~10/min baseline to a peak of **52,176/min** for ~7 min on a mega harness restart (~250k point-reads), then settled. Streaming reads stayed healthy (~1k/min, the post-2026-05-14 SSE baseline). Append-ops zero — no active write loop.
+
+**Root cause (two layers, both fabric + spool):**
+1. **Historical bloat (spool):** the old `consumer.cursor_advanced` self-amplification loop (each cursor ack appended an audit event → advanced the cursor → appended another) bloated mega's session sub-forks before spool#7 stopped the emit ~2026-05-20. The events are still physically in the S2 streams: **~31.5M dead audit events across 23 session sub-forks** (each ~950k–2.5M, almost all under one session parent). Confirmed by reading a fork: `next_seq=2.49M`, tail all `consumer.cursor_advanced`, **zero** real events.
+2. **Restart trigger (fabric consumer-sdk):** on startup the SDK does per-fork reads that scanned this dead history as unary point-reads:
+   - `spawnForkConsumer` positioned fresh cursors via `latestSeq(fork, inboundFilter)`, whose adaptive-widening read returns **0** on an audit-only fork ("no match" ≡ "head is 0") → cursor created at seq 0 → backfill replays the whole fork.
+   - `markRepliedIfPresent` → `hasEventMatching` did a **forward read from seq 0** (`limit:1`, batch size 4) per fork, paging through the entire stream 4 records per S2 GET looking for a `post-message` that isn't there. **This was the dominant cost.**
+
+**Fixes (all merged + verified in prod):**
+- **fabric#26** — `SpoolClient.headSeq()` (raw `last=1`+`include_audit`, no filter → 1 record, never collapses to 0); `spawnForkConsumer` positions listChildren-discovered cursors there.
+- **fabric#27** — `hasEventMatching` probes the **tail** (`last:1`, bounded) instead of forward-from-0.
+- **spool#9** — cap the filtered forward-read scan (`forward_scan_cap()`, default 10k records; `SPOOL_FORWARD_SCAN_CAP` test seam); on a cap hit `next_seq` advances past everything scanned so reads make progress. Surgical: only capped reads change `next_seq`; all else keeps exact prior semantics (Local/Lineage convergence preserved). Defense-in-depth floor.
+
+**Verification (prod):** spool#9 deployed via `deploy-prod.yml` (6m37s, `/health` 200). Both fabric fixes merged; mega restarted (PGID 3305330) running the updated local `fabric/` checkout. **Isolated restart before fabric#27: unary 8.5k→28k/min sustained ~2 min. Isolated restart with all fixes: unary 631 for one minute, then 0** — ~45× reduction to a negligible one-time startup blip. Streaming steady ~355/min, 38 clean cursor spawns, 0 reconnects, `starting_seq=0` gone. Tests: spool full integration suite + new `scan_cap` test; 347 fabric/consumer-sdk tests incl. new `head-seq` test.
+
+**Not done (proposed, code-fix-only per Haakam):** the ~31.5M dead audit events are still in the streams — harmless now that reads are bounded, but they're S2 storage cost. Cleanup (trim) deferred. Also a stale **local fabric** dev instance (pid 76012, `bun src/index.ts`, 12 days old, idle) is running in `fabric/` — unrelated, probably should be killed.
+
 ## 2026-05-22 (session 10) — join teardown via thread metadata, not the join marker (fabric#25)
 
 End-to-end testing of `join_thread` (wire test against prod) found the consumer-side join-teardown from fabric#21 **didn't actually fire for new joins**. It keyed off a `ns=thread, type=joined` event, but Spool doesn't reliably surface that marker to a source-thread cursor.
