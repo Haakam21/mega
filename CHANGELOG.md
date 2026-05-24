@@ -21,6 +21,22 @@ Haakam asked whether the `join_thread` primitive could replace Spool's thread me
 - New tests: `join_requires_owner_on_source/target`, `cross_tenant_join_rejected` (faithful fabric-style delegate topology), `join_materializes_source_roster_onto_target` (cap + no-downgrade + a former source-only reader reading target post-join), `add_member_on_joined_source_rejected`, `patch_member_on_joined_source_rejected` (+ remove still allowed). 14 join tests + multi_tenancy + cursors + units all green.
 - Docs: spool `CLAUDE.md` Joins section + error-code table; mega `CLAUDE.md` `join_thread` bullet.
 
+### Simplify pass (spool `42fe68c`)
+`/simplify` (3 review agents) converged on the materialization: extracted it from `join.rs` into a tx-aware `membership::materialize_roster` helper (SQL for `thread_members` now lives in the module that owns the table), collapsed the per-member `INSERT` loop into one set-based `INSERT…SELECT…ON CONFLICT…RETURNING`, and `tokio::try_join!`'d the two `root_of` + two `owner_ids` lookups in `assert_same_tenant`. No behavior change; tests green.
+
+### Deployment (PR #11 + simplify → spool prod)
+- PR [#11](https://github.com/Haakam21/spool/pull/11) squash-merged to spool `main` (`5acef83`), CI green; simplify committed (`42fe68c`).
+- spool deploys: staging auto-deploys on CI; **prod is manual** (`gh workflow run deploy-prod.yml`). Triggered prod deploy → rollout COMPLETED, 2/2, `/health` 200. Join-authz hardening is **live in prod**.
+
+### Staging migration drift (fixed) + full data wipe (both envs)
+- Staging was 503 (pre-existing, unrelated to join-authz): its `cursors` table predated the in-place `seq_mode` addition to `007_cursors.sql`, so migration `008`'s `UPDATE cursors SET seq_mode` crashed every task at boot (the `CREATE TABLE IF NOT EXISTS` footgun — now documented in spool `CLAUDE.md`). Prod unaffected (its `cursors` had the column).
+- Haakam: data is throwaway → **full wipe of spool-staging AND spool-prod** (Postgres `DROP SCHEMA public CASCADE` + recreate via one-off Fargate task; S2 streams deleted via the basin API — ~891 staging, ~197 prod; `create_stream` is idempotent so leftover streams would resurface old events). Also cleared the ~31.5M dead audit events flagged in session 11.
+- **Prod re-bootstrap:** recovered tenant `mega@india-desert.exe.xyz` from a pre-wipe read-only snapshot; re-ran `scripts/setup-sessions.sh` (recreated `mega/sessions` + fabric-prod writer; fabric's bindings survived in fabric's own DB). Stale `mega/agentmail` topology (no longer wired) wiped.
+- **Restart lesson:** a spool wipe invalidates all server-side cursors → any running consumer loops on `cursor_not_found`. Must restart **both** mega's harness (`make stop && make start`) **and fabric-prod** (`--force-new-deployment`). Initially restarted only the harness; the e2e reply published but didn't dispatch until fabric-prod was restarted too. Full procedure in memory `topics/spool-staging-db-reset-and-migration-landmine.md`.
+
+### E2E verification (post-wipe)
+Sent a health-check email from the org's `youthfuljob442@agentmail.to` → `mega1@agentmail.to`; mega received → woke Claude in 451ms (fork `mega/sessions/<uuid>`) → `agentmail-action.reply` → reply delivered threaded. Full live round-trip confirmed working on the freshly-rebuilt infrastructure.
+
 ## 2026-05-23 (session 11) — kill the S2 read-spike on restart (fabric#26 + #27, spool#9)
 
 The S2 founder flagged abnormal read usage again (first time was 2026-05-14, the 416-polling issue — different cause). Verified via the S2 metrics API: spool-prod unary read-ops spiked from a ~10/min baseline to a peak of **52,176/min** for ~7 min on a mega harness restart (~250k point-reads), then settled. Streaming reads stayed healthy (~1k/min, the post-2026-05-14 SSE baseline). Append-ops zero — no active write loop.
@@ -40,7 +56,7 @@ The S2 founder flagged abnormal read usage again (first time was 2026-05-14, the
 
 **Verification (prod):** spool#9 deployed via `deploy-prod.yml` (6m37s, `/health` 200). Both fabric fixes merged; mega restarted (PGID 3305330) running the updated local `fabric/` checkout. **Isolated restart before fabric#27: unary 8.5k→28k/min sustained ~2 min. Isolated restart with all fixes: unary 631 for one minute, then 0** — ~45× reduction to a negligible one-time startup blip. Streaming steady ~355/min, 38 clean cursor spawns, 0 reconnects, `starting_seq=0` gone. Tests: spool full integration suite + new `scan_cap` test; 347 fabric/consumer-sdk tests incl. new `head-seq` test.
 
-**Not done (proposed, code-fix-only per Haakam):** the ~31.5M dead audit events are still in the streams — harmless now that reads are bounded, but they're S2 storage cost. Cleanup (trim) deferred. Also a stale **local fabric** dev instance (pid 76012, `bun src/index.ts`, 12 days old, idle) is running in `fabric/` — unrelated, probably should be killed.
+**Not done (proposed, code-fix-only per Haakam):** the ~31.5M dead audit events are still in the streams — harmless now that reads are bounded, but they're S2 storage cost. Cleanup (trim) deferred. _(Resolved 2026-05-24: the full data wipe of spool-prod + spool-staging deleted every S2 stream in both basins — see session 12.)_ Also a stale **local fabric** dev instance (pid 76012, `bun src/index.ts`, 12 days old, idle) is running in `fabric/` — unrelated, probably should be killed.
 
 ## 2026-05-22 (session 10) — join teardown via thread metadata, not the join marker (fabric#25)
 
