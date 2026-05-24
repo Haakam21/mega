@@ -2,6 +2,25 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-05-24 (session 12) — harden join authorization (spool)
+
+Haakam asked whether the `join_thread` primitive could replace Spool's thread membership/invitation system. Answer: no — they're orthogonal (membership = principal authz; join = stream topology), and join is built *on top of* membership (`join_as` calls `require_role`). But the question surfaced a real gap he then asked me to think through: **what members are allowed to join, and into which thread.**
+
+**Two holes in the old gate (flat `Writer` on both):**
+1. **Hijack** — a mere Writer on a shared thread S could `join(S → T)` into a thread it controls, redirecting S's producers/readers into T.
+2. **Silent visibility grant** — reads authorize *once* against the cursor's home thread (`spool-cursors/src/lib.rs`), and the chain walker crosses the join boundary into the target with **no per-segment re-check**. So `join(S → T)` handed every Reader-of-S free reads of T's future events with zero T membership.
+
+**Decisions (with Haakam):** (a) op-gate = **Owner on both + same-tenant scope**; (b) read-leak = **materialize membership** at join time. Verified the delegation worry was a non-issue: fabric runs joins as `fabric-prod` (only a Writer on the tenant parent), but the actual joins are child↔child session forks, and the fork *creator* becomes Owner (`create_thread_as`), so `fabric-prod` already satisfies Owner-on-both for the forks it joins. No fabric code change needed.
+
+**Shipped (spool, all green — 12 join integration tests + unit):**
+- `join_as` now requires **Owner on source and target** (source is dissolved = `delete_thread`-grade; target absorbs + discloses = Owner-grade).
+- `assert_same_tenant` — walk both threads to their fork-tree roots (`root_of`); same root short-circuits, else the roots' Owner sets must intersect, else new `CrossTenantJoin` error (403, `cross_tenant_join`).
+- **Membership materialization** in the join tx: copy source's roster onto target, Owner→Writer capped (no new owners minted), existing higher target role never downgraded (rank-`CASE` upsert). Ordinary `thread_members` rows → auditable + revocable. `thread.joined` marker records `members_materialized`; target membership cache invalidated post-commit.
+- New error variant wired through `spool-types` (+ display-prefix drift test), `spool-api` status map, `spool-client` `map_error` (+ unit test).
+- **Membership frozen on a joined source** (`ensure_not_joined`): `add_member` / `patch_member` on a joined thread return `ThreadAlreadyJoined`. Closes the post-join escalation vector — publish authorizes `Writer` against the addressed thread *before* the terminal rewrite (`publish_events`), so adding/promoting a member on a dissolved source would grant cross-boundary write access into the terminal. `remove_member` stays allowed (revocation only reduces access). Caught a hole beyond the original ask: `patch_member` is the same vector as `add_member`, not just new members.
+- New tests: `join_requires_owner_on_source/target`, `cross_tenant_join_rejected` (faithful fabric-style delegate topology), `join_materializes_source_roster_onto_target` (cap + no-downgrade + a former source-only reader reading target post-join), `add_member_on_joined_source_rejected`, `patch_member_on_joined_source_rejected` (+ remove still allowed). 14 join tests + multi_tenancy + cursors + units all green.
+- Docs: spool `CLAUDE.md` Joins section + error-code table; mega `CLAUDE.md` `join_thread` bullet.
+
 ## 2026-05-23 (session 11) — kill the S2 read-spike on restart (fabric#26 + #27, spool#9)
 
 The S2 founder flagged abnormal read usage again (first time was 2026-05-14, the 416-polling issue — different cause). Verified via the S2 metrics API: spool-prod unary read-ops spiked from a ~10/min baseline to a peak of **52,176/min** for ~7 min on a mega harness restart (~250k point-reads), then settled. Streaming reads stayed healthy (~1k/min, the post-2026-05-14 SSE baseline). Append-ops zero — no active write loop.
