@@ -239,7 +239,7 @@ Haakam's Slack user ID: `U08TMCS2KRT`, DM channel: `D0AS9T5CP4K`. Mega's bot_use
 
 ### Testing
 - `make test` — run all tests (unit + E2E)
-- `make test-unit` — unit tests only (env + interval + log-rotator + watchdog + spool-loop helpers + Linear HMAC). Fabric-side coverage lives in the fabric repo's own `bun test`.
+- `make test-unit` — unit tests only (env + interval + log-rotator + watchdog + spool-loop helpers + Linear HMAC). Fabric-side coverage lives in the fabric repo's own `npm test` (vitest; fabric runs on Node via tsx).
 - `make test-e2e` — E2E tests (requires harness running via `make start`)
 - Tests use Bun's built-in test runner (`bun test`).
 

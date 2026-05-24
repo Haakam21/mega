@@ -2,6 +2,26 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-05-24 (session 13) — migrate fabric from Bun to Node
+
+Haakam asked to migrate the fabric repo off the Bun runtime onto Node. Surveyed the surface first: `invoke.ts` already used `node:child_process`, `crypto.ts` used `node:crypto`, and the SSE client path was web-standard `fetch`/`getReader` — so the runtime-specific touchpoints were narrower than feared. Chose **`tsx`** for the runtime (run `.ts` directly, no transpile step, preserves the 134 extensionless imports) and **vitest** for tests (Jest-compatible `expect`, so the 26 `bun:test` files were near-mechanical swaps; no mocks/spies were in use).
+
+**Substantive code changes (not just config):**
+- `core/http-server.ts`: replaced `Bun.serve` with a `node:http` server bridging `IncomingMessage`/`ServerResponse` ↔ web `Request`/`Response`. Streams `ReadableStream` bodies (SSE-capable), `closeAllConnections()` on stop. `startServer` takes a `fetch` callback (mirrors Bun) and returns a `ServerHandle`. `FakeSpool` reuses it.
+- `core/base64.ts` (new): Bun's `Uint8Array.fromBase64()`/`.toBase64()` don't exist in Node, and `Buffer.from(_,"base64")` is **lenient** (silently drops invalid chars) — added a strictly-validating decoder so malformed master-key/seckey input still rejects. Wired into `env.ts` + `api/util.ts`.
+- vitest config sets `fileParallelism: false` — **load-bearing**: integration tests each `drop schema … cascade` on one shared Postgres; vitest parallelizes files by default (Bun ran them serially).
+- One assertion fixed for vitest semantics: `expect(() => asyncFn()).toThrow()` → `await expect(asyncFn()).rejects.toThrow()`.
+
+**Toolchain/infra:** scripts → tsx/vitest; `tsx` is a prod dep; `bun-types` → `@types/node`; `bun.lock` → `package-lock.json` (both packages); Dockerfile `oven/bun:1` → `node:22-slim` + `npm ci --omit=dev` + `node --import tsx`; CI `setup-bun` → `setup-node@22`. New fabric `CHANGELOG.md`.
+
+### Simplify pass (fabric `231a100`)
+`/simplify` (3 review agents): added a 10MB request-body cap (→413, restores a `Bun.serve` default the Node bridge dropped), a `Readable` error listener on the streaming path (prevents an unhandled-error crash if SSE responses are ever added), removed a no-op `tryDecodeBase64` wrapper, deduped fake-spool's `json()`, trimmed migration-narrating comments.
+
+### Deployment (PR #29 → fabric staging + prod)
+- PR [#29](https://github.com/Haakam21/fabric/pull/29) squash-merged to fabric `main` (`d88664e`), CI green (test + docker build).
+- fabric deploys: staging auto-deploys on CI success; **prod is manual** (`gh workflow run deploy-prod.yml -f ref=main`). Staging deployed → E2E verified (`/health`, `/v1/identity`=`fabric-staging`, 404 routing, malformed-webhook handled). Prod deployed → E2E verified (`/v1/identity`=`fabric-prod`). **Node fabric is live in both environments.** Mega itself stays on Bun — only fabric migrated.
+- Doc fix: mega `CLAUDE.md` line 242 (fabric "`bun test`" → "`npm test` (vitest)").
+
 ## 2026-05-24 (session 12) — harden join authorization (spool)
 
 Haakam asked whether the `join_thread` primitive could replace Spool's thread membership/invitation system. Answer: no — they're orthogonal (membership = principal authz; join = stream topology), and join is built *on top of* membership (`join_as` calls `require_role`). But the question surfaced a real gap he then asked me to think through: **what members are allowed to join, and into which thread.**
