@@ -8,3 +8,6 @@ sessions
 memories
 fabric
 .claude/scheduled_tasks.lock
+
+# Codex steering thread registry (local)
+.codex-threads.json

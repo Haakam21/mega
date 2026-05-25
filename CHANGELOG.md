@@ -2,6 +2,20 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-05-25 (session 14) — ship steerable codex (`MEGA_CODEX_MODE=steer`)
+
+Haakam set a goal: ship steerable codex (build → code-review + fix → e2e → docs/memories). Built the steering engine designed in `fabric/docs/codex-steering-plan.md` (PR #30) — an opt-in alternative codex runtime where a mid-turn event is injected into the *running* turn via codex app-server's `turn/steer` instead of the one-shot abort+recombine.
+
+**Where the code lives** (consumer-sdk, in the fabric repo): `app-server/protocol.ts` (pinned protocol types), `app-server/client.ts` (`AppServerClient` — one long-lived `codex app-server` daemon over stdio JSON-RPC, multiplexing a thread per fork, respawn-safe), `app-server/thread-registry.ts` (durable `fork→{threadId,lastConsumedSeq}`), `steering-consumer.ts` (`SteeringConsumer` — idle/turning machine, ack-at-completion, at-least-once). `fork-channel.ts` selects the engine; fabric server unchanged except a schema fix (below).
+
+**mega wiring** (`core/spool-loop.ts`): `MEGA_CODEX_MODE=exec|steer` (default exec); in steer mode one shared `AppServerClient` + `ThreadRegistry`, and a *fork-stable* MCP config (`forkStableMcp` — framework headers only; the agent supplies per-message ids via `read_thread`) passed into all three channels via `makeSteering`. `MEGA_CODEX_THREADS_PATH` persists the map (gitignored). Watchdog + `make stop` patterns extended to `codex app-server`.
+
+**Code review (ran the xhigh review on the steering changes) → fixed 5 real bugs**: (1) same-chunk `turn/completed`-before-turnId race that would hang a fork in `turning` — stash + reconcile; (2) no hung-turn timeout → added per-turn timeout → `turn/interrupt` + fail-forward; (3) handler leak — `dispose()` on fork join-teardown; (4) first-boot thread-create failure stranding the fork in `init` — bounded retry; (5) **dual-use header-field schema bug**: my earlier "real JSON Schema" change *deleted* `headerMap` fields, which broke the agent's ability to supply `channel` to start a cross-channel Slack post (a regression already live in prod) and would break steering's fork-stable routing — fixed to keep them **optional** (header fills if omitted, agent can still set). Refuted several "DROP" claims (misread cursor/ack semantics — it's at-least-once, replays never drop).
+
+**Tested e2e**: unit (`test/steering-consumer.test.ts`, fake client, 6 cases) + a live e2e driving the real `SteeringConsumer` + `AppServerClient` + recording MCP against gpt-5.5 (`scripts/e2e-steering-consumer.ts`) — same-turn steer confirmed, ack range correct, fork-stable headers delivered, clean boot. Full suite green at 210; both typechecks clean; mega builds.
+
+**Rollout**: opt-in, default still `exec`. Sessions topology is the intended first target. Not flipped on the live harness in this session — flip with `MEGA_CODEX_MODE=steer` + restart when ready.
+
 ## 2026-05-25 (session 14) — add Codex as a second agent backend
 
 Haakam asked to extend fabric to work with **codex** (OpenAI's coding CLI) in addition to claude code. The realization that shaped the work: fabric the *server* never runs agents — the agent CLI is spawned by `@fabric/consumer-sdk`'s `invokeClaude` on the tenant (mega) side — so this is mostly an SDK change, plus one fabric-server detail. Verified codex 0.118.0's actual surface before designing (`codex exec`, `--json`, `-o`, `-c` dotted-path TOML overrides, `resume [SESSION_ID]`, native streamable-HTTP MCP with static headers). Decisions (asked Haakam): single global `MEGA_AGENT` switch (not per-channel), and capture-and-resume codex sessions (not stateless).

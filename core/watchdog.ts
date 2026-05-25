@@ -15,11 +15,12 @@ import { startInterval, type IntervalHandle } from "./interval";
 
 const DEFAULT_INTERVAL_MS = 30_000;
 const DEFAULT_THRESHOLD = 8;
-// Matches both agent CLIs the SDK can spawn (see MEGA_AGENT). The `(^|/)`
-// boundary matches whether the binary was invoked by bare name (`codex exec`,
-// resolved via PATH) or by absolute path (`/home/.../codex exec`, e.g. when
+// Matches the agent processes the SDK can spawn (see MEGA_AGENT / MEGA_CODEX_MODE):
+// `claude --print` (claude), `codex exec` (codex one-shot), and `codex app-server`
+// (codex steering daemon). The `(^|/)` boundary matches whether the binary was
+// invoked by bare name (resolved via PATH) or absolute path (e.g. when
 // MEGA_CODEX_BIN is set) — a plain `^` anchor would miss the abspath form.
-const DEFAULT_PATTERN = "(^|/)(claude --print|codex exec)";
+const DEFAULT_PATTERN = "(^|/)(claude --print|codex exec|codex app-server)";
 
 const intervalMs = () => parsePositiveInt("MEGA_WATCHDOG_INTERVAL_MS", DEFAULT_INTERVAL_MS);
 const threshold = () => parseNonNegativeInt("MEGA_WATCHDOG_THRESHOLD", DEFAULT_THRESHOLD);

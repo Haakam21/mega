@@ -13,12 +13,17 @@
  */
 
 import {
+  AppServerClient,
   SpoolClient,
   startForkedChannel,
+  ThreadRegistry,
   type AgentBackend,
+  type ForkChannelConfig,
+  type McpServerConfig,
   type SpoolEvent,
 } from "../fabric/packages/consumer-sdk/src";
 import { parseString } from "./env";
+import { join } from "node:path";
 import {
   AGENTMAIL_EVENT_TYPES,
   AGENTMAIL_NS,
@@ -121,6 +126,51 @@ const CLIENT_ID = `mega@${process.env.MEGA_DOMAIN ?? "india-desert.exe.xyz"}`;
 const AGENT_BACKEND: AgentBackend =
   parseString("MEGA_AGENT", "claude") === "codex" ? "codex" : "claude";
 const CODEX_BIN = process.env.MEGA_CODEX_BIN;
+
+// Codex engine: `exec` (one-shot per turn, default) or `steer` (long-lived
+// app-server thread per fork; a mid-turn event steers the live turn instead of
+// aborting + restarting). Steering only applies when MEGA_AGENT=codex.
+const CODEX_MODE = parseString("MEGA_CODEX_MODE", "exec") === "steer" ? "steer" : "exec";
+const STEERING_ENABLED = AGENT_BACKEND === "codex" && CODEX_MODE === "steer";
+const CODEX_THREADS_PATH = parseString(
+  "MEGA_CODEX_THREADS_PATH",
+  join(process.cwd(), ".codex-threads.json"),
+);
+
+// One app-server daemon + one thread registry shared across every steering
+// channel. Constructed lazily so non-steer runs spawn no daemon.
+let _appServer: AppServerClient | undefined;
+let _threadRegistry: ThreadRegistry | undefined;
+function steeringSingletons(): { client: AppServerClient; registry: ThreadRegistry } {
+  if (!_appServer) _appServer = new AppServerClient({ codexBin: CODEX_BIN, clientName: "mega" });
+  if (!_threadRegistry) _threadRegistry = new ThreadRegistry(CODEX_THREADS_PATH);
+  return { client: _appServer, registry: _threadRegistry };
+}
+
+/** Fork-stable MCP config for steering: both action endpoints with only the
+ *  framework headers (X-Client-Id, X-Fabric-Fork). Per-message routing headers
+ *  are deliberately omitted — the steered agent supplies specific ids via tool
+ *  args (it has read_thread + real tool schemas). */
+function forkStableMcp(fork: string): Record<string, McpServerConfig> {
+  const both = { ...mcpServer("slack-action", fork, {}), ...mcpServer("agentmail-action", fork, {}) };
+  const out: Record<string, McpServerConfig> = {};
+  for (const [name, spec] of Object.entries(both)) {
+    out[name] = { url: spec.url, http_headers: spec.headers };
+  }
+  return out;
+}
+
+/** Build the `steering` block for a channel, or undefined when not in steer
+ *  mode (channel then uses the one-shot ForkConsumer). */
+function makeSteering(systemPrompt: string): ForkChannelConfig["steering"] | undefined {
+  if (!STEERING_ENABLED) return undefined;
+  const { client, registry } = steeringSingletons();
+  return {
+    client,
+    registry,
+    threadSetup: ({ fork }) => ({ mcpServers: forkStableMcp(fork), systemPrompt, cwd: process.cwd() }),
+  };
+}
 
 // Slack bot's own user id — needed to detect @mentions in plain `message`
 // events (their text contains `<@<bot_id>>`). Slack delivers an @mention as
@@ -266,6 +316,7 @@ export async function startSlack(spool: SpoolClient, parent: string): Promise<vo
     systemPrompt: SLACK_SYSTEM_PROMPT,
     backend: AGENT_BACKEND,
     codexBin: CODEX_BIN,
+    steering: makeSteering(SLACK_SYSTEM_PROMPT),
     // Stable session id across the "top-level @mention in channel →
     // first user thread reply on per-thread fork" handoff. Both events
     // map to the same leaf fork name; Claude --resume keeps the
@@ -334,6 +385,7 @@ export async function startSessions(spool: SpoolClient, parent: string): Promise
     systemPrompt: SESSIONS_SYSTEM_PROMPT,
     backend: AGENT_BACKEND,
     codexBin: CODEX_BIN,
+    steering: makeSteering(SESSIONS_SYSTEM_PROMPT),
     sessionIdFor: (_ev, { fork }) => fork,
     // Track outputs from either action — used by the loop-prevention path.
     repliedIndicator: { ns: "slack", type: "post-message" },
@@ -437,6 +489,7 @@ export async function startAgentMail(spool: SpoolClient, parent: string): Promis
     systemPrompt: AGENTMAIL_SYSTEM_PROMPT,
     backend: AGENT_BACKEND,
     codexBin: CODEX_BIN,
+    steering: makeSteering(AGENTMAIL_SYSTEM_PROMPT),
     mcpServers: ({ fork, event }) => {
       const d = event.data as Record<string, unknown>;
       return mcpServer("agentmail-action", fork, {

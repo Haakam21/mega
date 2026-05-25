@@ -94,12 +94,15 @@ mega/
 ### Agent backend (claude or codex)
 The SDK spawns one of two agent CLIs per turn, selected by `MEGA_AGENT` (`claude` default, `codex` opt-in; unrecognized values fall back to claude). One global switch across every channel — wired in `core/spool-loop.ts` as `backend` on each `startForkedChannel`/`startSessions` config. `MEGA_CODEX_BIN` overrides the codex binary path. The two backends differ only in *how* the SDK invokes them (claude: `--print --mcp-config <json> --session-id|--resume`; codex: `codex exec [resume <id>] --json -o <file> -c mcp_servers.…` with session id captured from the `thread.started` JSONL event); fabric's hosted MCP endpoint is identical for both. See `@fabric/consumer-sdk`'s `src/invoke.ts` for the full contract.
 
+#### Codex steering (`MEGA_CODEX_MODE=steer`)
+When `MEGA_AGENT=codex`, `MEGA_CODEX_MODE` picks the codex *engine*: `exec` (default — one-shot per turn, abort+recombine on a mid-turn event) or `steer`. In `steer` mode the SDK runs a single long-lived `codex app-server` daemon and maps each Spool fork to one app-server **thread**; a new event arriving mid-turn is injected via `turn/steer` into the running turn (no abort, no lost work) instead of restarting. `core/spool-loop.ts` constructs one shared `AppServerClient` + `ThreadRegistry` (`steeringSingletons`) and passes a `steering` block (with a *fork-stable* MCP config — `forkStableMcp`, framework headers only; the agent supplies per-message ids via `read_thread`) into each channel via `makeSteering`. The fork→thread map persists to `MEGA_CODEX_THREADS_PATH` (default `<repo>/.codex-threads.json`, gitignored) so threads resume across restarts. Steering is **codex-only** and opt-in; claude and `codex exec` are unaffected. Design + decisions: `fabric/docs/codex-steering-plan.md`.
+
 ### Process Safety
 Agent invocations can hang, spawn long-lived tool subprocesses, or fail silently. The harness protects against runaway processes in several layers; most of the per-invocation safety now lives in `@fabric/consumer-sdk` (the SDK's `invokeAgent` spawns the agent CLI detached, tree-kills on timeout, and — for claude — falls back from `--session-id` to `--resume` on first-try failure; codex falls back from `resume <id>` to a fresh session). Mega-side process-safety:
 
 - **`make stop` tree-kills the harness group** — `make start` runs the harness under `setsid` so `harness.pid` holds the PGID. `stop` sends `kill -TERM -- -$pgid` (which covers whichever agent backend ran, since both spawn inside the harness group), polls, then SIGKILLs stragglers, plus a belt-and-suspenders `pkill -KILL -f` for `^claude --print` AND `^codex exec` orphans from earlier runs.
 - **In-memory dedup window** — SDK's `BoundedFifoSet` caps the per-channel dedup window at 10 000 ids. Past events are skipped by cursor position (Spool persists `cursor_seq`); the dedup window only catches within-session retries.
-- **Process-count watchdog** (`core/watchdog.ts`) — every `MEGA_WATCHDOG_INTERVAL_MS` (default 30 s) the harness runs `pgrep -cf` against the default pattern `(^|/)(claude --print|codex exec)` (matches both backends, by bare name or absolute path — so `MEGA_CODEX_BIN=/abs/path/codex` is still counted) and warns into `harness.log` if the count exceeds `MEGA_WATCHDOG_THRESHOLD` (default 8). Belt-and-suspenders: catches leaks if every other layer lets one through. Pattern is overridable via `MEGA_WATCHDOG_PATTERN`. The interval timer is `unref()`'d so it never blocks process exit.
+- **Process-count watchdog** (`core/watchdog.ts`) — every `MEGA_WATCHDOG_INTERVAL_MS` (default 30 s) the harness runs `pgrep -cf` against the default pattern `(^|/)(claude --print|codex exec|codex app-server)` (matches claude, codex one-shot, AND the codex steering daemon, by bare name or absolute path — so `MEGA_CODEX_BIN=/abs/path/codex` is still counted) and warns into `harness.log` if the count exceeds `MEGA_WATCHDOG_THRESHOLD` (default 8). In steer mode the `codex app-server` is a single expected long-lived process — well under the threshold; the count still guards against a leak. Belt-and-suspenders: catches leaks if every other layer lets one through. Pattern is overridable via `MEGA_WATCHDOG_PATTERN`. The interval timer is `unref()`'d so it never blocks process exit.
 - **Bounded `harness.log`** (`core/log-rotator.ts`) — every `MEGA_LOG_ROTATE_INTERVAL_MS` (default 60 s) the harness checks `harness.log` size and truncates in place if over `MEGA_LOG_MAX_BYTES` (default 10 MB). `make start` redirects with `>>` (O_APPEND) — load-bearing: the kernel atomically seeks to end-of-file before each write, so an in-place truncate from inside the harness actually frees disk space.
 
 Stderr from every agent invocation is inherited (→ `harness.log`) so hangs and errors are visible instead of silently dropped. The SDK's `invokeAgent` logs `enter` / `spawn` / `exit` / `settle` / `timeout` / `abort` with `backend=`, `session=`, `pid=`, `prompt_bytes=`, and `output_bytes=` fields so operators can correlate harness.log lines back to specific threads.
@@ -110,7 +113,7 @@ Stderr from every agent invocation is inherited (→ `harness.log`) so hangs and
 |---|---|---|
 | `MEGA_WATCHDOG_INTERVAL_MS` | `30000` | watchdog poll interval |
 | `MEGA_WATCHDOG_THRESHOLD` | `8` | warn when matching process count exceeds this |
-| `MEGA_WATCHDOG_PATTERN` | `(^\|/)(claude --print\|codex exec)` | `pgrep -f` pattern for the watchdog (matches both agent backends, bare-name or absolute-path) |
+| `MEGA_WATCHDOG_PATTERN` | `(^\|/)(claude --print\|codex exec\|codex app-server)` | `pgrep -f` pattern for the watchdog (matches claude, codex exec, and the codex steering daemon; bare-name or absolute-path) |
 | `MEGA_LOG_MAX_BYTES` | `10485760` (10 MB) | rotate `harness.log` when over this size |
 | `MEGA_LOG_ROTATE_INTERVAL_MS` | `60000` | log-rotator poll interval |
 | `MEGA_LOG_PATH` | `<repo>/harness.log` | log file path (test override) |
@@ -121,6 +124,8 @@ Stderr from every agent invocation is inherited (→ `harness.log`) so hangs and
 | `MEGA_HTTP_PORT` | `8000` | Shared HTTP server port (Linear webhook + /health). Single public port — exe.dev forwards 8000 by default. |
 | `MEGA_AGENT` | `claude` | Agent CLI the SDK spawns per turn, across every channel: `claude` or `codex`. Unrecognized → claude. |
 | `MEGA_CODEX_BIN` | `codex` | Path to the codex binary (used when `MEGA_AGENT=codex`). |
+| `MEGA_CODEX_MODE` | `exec` | Codex engine when `MEGA_AGENT=codex`: `exec` (one-shot per turn) or `steer` (long-lived app-server, mid-turn `turn/steer`). |
+| `MEGA_CODEX_THREADS_PATH` | `<repo>/.codex-threads.json` | Where steer mode persists the `fork→{threadId,lastConsumedSeq}` map (resume + crash-replay-skip). |
 
 All env vars are parsed via `core/env.ts` (`parsePositiveInt` / `parseNonNegativeInt` / `parseString`) — `0` for a positive-int knob is rejected and falls back to the default rather than silently passing through.
 

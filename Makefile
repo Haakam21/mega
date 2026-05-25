@@ -123,6 +123,7 @@ stop:
 	@# left from earlier runs that predate the tree-kill Makefile.
 	@pkill -KILL -f "(^|/)claude --print" 2>/dev/null || true
 	@pkill -KILL -f "(^|/)codex exec" 2>/dev/null || true
+	@pkill -KILL -f "(^|/)codex app-server" 2>/dev/null || true
 	@rm -f harness.pid
 	@echo "Agent harness stopped."
 
