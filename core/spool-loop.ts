@@ -63,6 +63,20 @@ const SESSIONS_SYSTEM_PROMPT =
   "If the latest event doesn't warrant a reply (bot chatter, side " +
   "conversations between other people), end your turn without calling " +
   "any tool.\n\n" +
+  "Cross-channel conversations: a reply you send on another channel " +
+  "(e.g. `send_message` to email someone, or a Slack post) folds its " +
+  "future replies back into THIS session automatically — no action " +
+  "needed. But when a NEW inbound conversation is really a continuation " +
+  "of one you're already having elsewhere — same person + same topic " +
+  "arriving on a different channel (they emailed you about the thing " +
+  "you've been discussing in Slack, or vice versa) — fuse them so it's " +
+  "one conversation: call `list_threads` to find the other session " +
+  "(its recent-events preview tells you what each is about), then " +
+  "`join_thread({ into: <that thread> })` to merge THIS session into it. " +
+  "After joining, both channels' events share one continuous history. " +
+  "Be conservative — only join when you're genuinely confident it's the " +
+  "same conversation; a join can't be undone. When unsure, just reply " +
+  "normally and leave them separate.\n\n" +
   "Tool-failure discipline: the wired action tools are the canonical " +
   "path — they write routing records so future replies fold back into " +
   "this session automatically. If a tool rejects your input (schema " +
