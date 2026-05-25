@@ -119,9 +119,10 @@ stop:
 			kill -KILL -- -$$pgid 2>/dev/null || true; \
 		fi; \
 	fi
-	@# Belt-and-suspenders: reap any orphaned claude processes left from
-	@# earlier runs that predate the tree-kill Makefile.
-	@pkill -KILL -f "^claude --print" 2>/dev/null || true
+	@# Belt-and-suspenders: reap any orphaned agent processes (either backend)
+	@# left from earlier runs that predate the tree-kill Makefile.
+	@pkill -KILL -f "(^|/)claude --print" 2>/dev/null || true
+	@pkill -KILL -f "(^|/)codex exec" 2>/dev/null || true
 	@rm -f harness.pid
 	@echo "Agent harness stopped."
 

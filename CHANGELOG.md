@@ -2,6 +2,31 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-05-25 (session 14) — add Codex as a second agent backend
+
+Haakam asked to extend fabric to work with **codex** (OpenAI's coding CLI) in addition to claude code. The realization that shaped the work: fabric the *server* never runs agents — the agent CLI is spawned by `@fabric/consumer-sdk`'s `invokeClaude` on the tenant (mega) side — so this is mostly an SDK change, plus one fabric-server detail. Verified codex 0.118.0's actual surface before designing (`codex exec`, `--json`, `-o`, `-c` dotted-path TOML overrides, `resume [SESSION_ID]`, native streamable-HTTP MCP with static headers). Decisions (asked Haakam): single global `MEGA_AGENT` switch (not per-channel), and capture-and-resume codex sessions (not stateless).
+
+**SDK (`@fabric/consumer-sdk`):**
+- `invokeClaude` → `invokeAgent({ backend: "claude" | "codex", … })`; `knownSessionIds: Set` → `sessions: SessionStore { known: Set; codexIds: Map }`. Both backends keep the detached-spawn + tree-kill-on-timeout/abort path.
+- codex backend: `codex exec [resume <id>] --json -o <tmp> --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -c mcp_servers.…`; system prompt prepended to the stdin prompt (codex has no `--append-system-prompt`); session id captured from the `thread.started` JSONL event → resumed by it next turn (fresh-session fallback if the rollout is gone); final message read from the `-o` file. MCP servers + per-event headers injected as `-c mcp_servers.<name>.{url,http_headers}` TOML overrides (codex speaks HTTP MCP natively — fabric's `/mcp/<type>` endpoint is unchanged for both backends).
+- `ForkChannelConfig` gains `backend?` + `codexBin?`; exports `AgentBackend` + `SessionStore`.
+
+**fabric server:** `toListedTool` now advertises a real JSON Schema (`zod-to-json-schema`) minus `headerMap`-filled fields, instead of an opaque object — codex's spec-compliant MCP client needs declared properties to know what to send. `unwrapWrappedInput` kept as a harmless guard for Claude Code's legacy wrapping. New dep `zod-to-json-schema@^3.25.2`.
+
+**mega:** `MEGA_AGENT` (default `claude`, validated) + `MEGA_CODEX_BIN` in `core/env.ts`/`core/spool-loop.ts`, wired into all three channels (`startSlack`/`startSessions`/`startAgentMail`). Process-safety patterns broadened to cover both backends: watchdog default → `^(claude --print|codex exec)`, `make stop` orphan-sweep adds a `^codex exec` pkill (the PGID kill already covered codex). `.env.example` documents the new knobs.
+
+**Tests:** consumer-sdk `codex-invoke.test.ts` (fake `codex` script — fresh vs resume argv, `-c` MCP overrides, session capture, JSONL parsers); fabric `mcp-schema.test.ts` (declared props + header-field stripping). Existing claude-path + abort tests retargeted to `invokeAgent`. All green: 172 fabric unit + 30 consumer-sdk tests, both typechecks clean.
+
+**Live validation:** logged in to codex (ChatGPT), updated the CLI `0.118.0 → 0.133.0` (user-local at `~/.local/bin`), set `~/.codex/config.toml` defaults (`model = gpt-5.5`, `model_reasoning_effort = xhigh`, `approval_policy = never`, `sandbox_mode = danger-full-access`), and ran a live E2E through the real `invokeAgent` codex path against an in-process streamable-HTTP MCP server: fresh run → session capture; `-c` MCP override reached the server with the per-invocation header; `resume <id>` kept continuity. The `resume` flag ordering is confirmed against codex 0.133.0.
+
+**Review fixes (xhigh code review, same session):**
+- **systemPrompt no longer re-injected on codex resume turns** (`invoke.ts`). It's prepended only on a *fresh* session (incl. the stale-resume fallback, which starts a new one); resume turns send the bare prompt, since codex's persisted rollout already holds the turn-1 system prompt. Re-validated live — continuity holds.
+- **stdin EPIPE no longer crashes the harness** (`invoke.ts::runProc`). Added a `proc.stdin.on("error", …)` listener; a child that exits before draining stdin (codex bad-config/auth/fast-crash) previously emitted an unhandled stream `error` → uncaughtException → whole-harness death. Pre-existing in the claude path, newly reachable via codex's faster failure modes.
+- **watchdog + `make stop` now match absolute-path binaries** (`watchdog.ts`, `Makefile`). Pattern `^…` → `(^|/)…`, so `MEGA_CODEX_BIN=/abs/path/codex` (as recommended) is still counted/swept instead of silently invisible.
+- **codexMcpArgs disambiguates name collisions** (`invoke.ts`). Two raw MCP-server names that sanitize to the same TOML token now get a hash suffix instead of the later `-c` silently overwriting the earlier server.
+- **whitespace-only codex final message no longer triggers the JSONL re-parse fallback** (`invoke.ts`); fallback fires only when the `-o` file is genuinely missing.
+- New tests: resume-skips-systemPrompt, codexMcpArgs collision. Suite: 204 (was 202).
+
 ## 2026-05-24 (session 13) — migrate fabric from Bun to Node
 
 Haakam asked to migrate the fabric repo off the Bun runtime onto Node. Surveyed the surface first: `invoke.ts` already used `node:child_process`, `crypto.ts` used `node:crypto`, and the SSE client path was web-standard `fetch`/`getReader` — so the runtime-specific touchpoints were narrower than feared. Chose **`tsx`** for the runtime (run `.ts` directly, no transpile step, preserves the 134 extensionless imports) and **vitest** for tests (Jest-compatible `expect`, so the 26 `bun:test` files were near-mechanical swaps; no mocks/spies were in use).

@@ -10,11 +10,16 @@ import { startInterval, type IntervalHandle } from "./interval";
 // Configurable via env:
 //   MEGA_WATCHDOG_INTERVAL_MS   poll interval (default 30_000)
 //   MEGA_WATCHDOG_THRESHOLD     warn when count > threshold (default 8)
-//   MEGA_WATCHDOG_PATTERN       pgrep -f pattern (default "^claude --print")
+//   MEGA_WATCHDOG_PATTERN       pgrep -f pattern (default matches both agent
+//                               backends: "(^|/)(claude --print|codex exec)")
 
 const DEFAULT_INTERVAL_MS = 30_000;
 const DEFAULT_THRESHOLD = 8;
-const DEFAULT_PATTERN = "^claude --print";
+// Matches both agent CLIs the SDK can spawn (see MEGA_AGENT). The `(^|/)`
+// boundary matches whether the binary was invoked by bare name (`codex exec`,
+// resolved via PATH) or by absolute path (`/home/.../codex exec`, e.g. when
+// MEGA_CODEX_BIN is set) — a plain `^` anchor would miss the abspath form.
+const DEFAULT_PATTERN = "(^|/)(claude --print|codex exec)";
 
 const intervalMs = () => parsePositiveInt("MEGA_WATCHDOG_INTERVAL_MS", DEFAULT_INTERVAL_MS);
 const threshold = () => parseNonNegativeInt("MEGA_WATCHDOG_THRESHOLD", DEFAULT_THRESHOLD);

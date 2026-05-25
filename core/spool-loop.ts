@@ -1,12 +1,12 @@
 /**
  * Mega's channel runners — thin glue over `@fabric/consumer-sdk`.
  *
- * The SDK owns fork discovery, per-fork tail, dedup, and Claude
- * invocation with MCP wired to fabric's hosted action tools. Mega
- * supplies tenant-specific config: prompt builder, response gate,
- * system prompt, MCP URLs.
+ * The SDK owns fork discovery, per-fork tail, dedup, and agent
+ * invocation (claude or codex, per MEGA_AGENT) with MCP wired to
+ * fabric's hosted action tools. Mega supplies tenant-specific config:
+ * prompt builder, response gate, system prompt, MCP URLs.
  *
- * No reply text travels through stdout anymore — Claude calls fabric's
+ * No reply text travels through stdout anymore — the agent calls fabric's
  * `reply` tool (or doesn't), which publishes `message.end` to the fork
  * directly. Mega's previous job of stitching responses into Spool
  * events is gone.
@@ -15,8 +15,10 @@
 import {
   SpoolClient,
   startForkedChannel,
+  type AgentBackend,
   type SpoolEvent,
 } from "../fabric/packages/consumer-sdk/src";
+import { parseString } from "./env";
 import {
   AGENTMAIL_EVENT_TYPES,
   AGENTMAIL_NS,
@@ -112,6 +114,13 @@ const SESSIONS_CURSORS = {
 
 const FABRIC_URL = process.env.FABRIC_URL ?? "https://fabric.delivery";
 const CLIENT_ID = `mega@${process.env.MEGA_DOMAIN ?? "india-desert.exe.xyz"}`;
+
+// Which agent CLI the SDK spawns per turn, across every channel. `claude`
+// (default) or `codex`. Anything else falls back to `claude`. Optional
+// `MEGA_CODEX_BIN` overrides the codex binary path (default `codex` on PATH).
+const AGENT_BACKEND: AgentBackend =
+  parseString("MEGA_AGENT", "claude") === "codex" ? "codex" : "claude";
+const CODEX_BIN = process.env.MEGA_CODEX_BIN;
 
 // Slack bot's own user id — needed to detect @mentions in plain `message`
 // events (their text contains `<@<bot_id>>`). Slack delivers an @mention as
@@ -255,6 +264,8 @@ export async function startSlack(spool: SpoolClient, parent: string): Promise<vo
     dedupId: slackDedupId,
     buildPrompt: buildSlackPrompt,
     systemPrompt: SLACK_SYSTEM_PROMPT,
+    backend: AGENT_BACKEND,
+    codexBin: CODEX_BIN,
     // Stable session id across the "top-level @mention in channel →
     // first user thread reply on per-thread fork" handoff. Both events
     // map to the same leaf fork name; Claude --resume keeps the
@@ -321,6 +332,8 @@ export async function startSessions(spool: SpoolClient, parent: string): Promise
     dedupId: sessionDedupId,
     buildPrompt: buildSessionPrompt,
     systemPrompt: SESSIONS_SYSTEM_PROMPT,
+    backend: AGENT_BACKEND,
+    codexBin: CODEX_BIN,
     sessionIdFor: (_ev, { fork }) => fork,
     // Track outputs from either action — used by the loop-prevention path.
     repliedIndicator: { ns: "slack", type: "post-message" },
@@ -422,6 +435,8 @@ export async function startAgentMail(spool: SpoolClient, parent: string): Promis
     repliedIndicator: { ns: "agentmail", type: "reply" },
     buildPrompt: buildAgentMailPrompt,
     systemPrompt: AGENTMAIL_SYSTEM_PROMPT,
+    backend: AGENT_BACKEND,
+    codexBin: CODEX_BIN,
     mcpServers: ({ fork, event }) => {
       const d = event.data as Record<string, unknown>;
       return mcpServer("agentmail-action", fork, {
