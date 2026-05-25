@@ -2,6 +2,17 @@
 
 All self-modifications by the agent are logged here.
 
+## 2026-05-25 (session 14) — cross-channel hardening + Slack-outage root cause
+
+After shipping steerable codex, testing it on live Slack surfaced a multi-hour outage (Mega stopped replying). Root-caused to a **fabric** bug, not steering: a session-routed inbound publish landing right after its fork was minted 404s on Spool's create→read lag, and `onPublishFailure` then *permanently* flipped the `mega/sessions` slack binding to `error` — so every later Slack event went only to the unconsumed legacy `slack/<bot>` binding. (Diagnosed via `/ecs/fabric-prod` CloudWatch logs + the binding's `last_error`/`updated_at`; temporarily instrumented the dispatcher, then reverted.) Fixes in the fabric repo: `publishWithRetry` (retry the 404 race + network errors, bounded ~1.4s) and inbound `onPublishFailure` no longer disables a binding on a single per-event failure. Reactivated the stuck binding live (DELETE + recreate — no PATCH/reactivate endpoint).
+
+Confirmed Haakam wants **cross-channel conversations**, so the session-routing layer stays (not consolidated to provider-path threads). Three cross-channel workstreams landed:
+- **mega (this commit, `31f9b8a`):** `SESSIONS_SYSTEM_PROMPT` now tells Mega that replies it sends on another channel auto-fold back, and to fuse a genuinely-matching independent inbound conversation via `list_threads` → `join_thread` (conservatively — joins are irreversible).
+- **fabric:** binding resilience (above).
+- **flow #1 verified live, end-to-end:** Slack → Mega `send_message` → reverse-route mints a sub-fork → recipient's email reply folds into that sub-fork → Mega handles it. Decision: Mega **replies by email** (the channel the reply arrived on); it does not report back to Slack unless asked. (First time reverse-route actually fired on live traffic — and it survived a deploy rollover mid-test, validating the resilience fixes.)
+
+Note: "session" in fabric is not a separate primitive — it's a Spool thread playing the role of one logical conversation, addressed via the `session_routes` (key → thread) table; the agent-facing API is already all `*_thread` tools. The routing indirection is exactly what buys cross-channel continuity (and was the source of the race).
+
 ## 2026-05-25 (session 14) — ship steerable codex (`MEGA_CODEX_MODE=steer`)
 
 Haakam set a goal: ship steerable codex (build → code-review + fix → e2e → docs/memories). Built the steering engine designed in `fabric/docs/codex-steering-plan.md` (PR #30) — an opt-in alternative codex runtime where a mid-turn event is injected into the *running* turn via codex app-server's `turn/steer` instead of the one-shot abort+recombine.
